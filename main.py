@@ -37,6 +37,16 @@ WATI_API_URL  = os.getenv("WATI_API_URL", "https://eu-api.wati.io/602557")
 WATI_TOKEN    = os.getenv("WATI_TOKEN", "")
 POLL_INTERVAL = int(os.getenv("W0_POLL_INTERVAL", "60"))
 SEEN_FILE     = os.getenv("W0_SEEN_FILE", "w0_seen.json")
+HC_PING_URL   = os.getenv("HC_PING_URL", "https://hc-ping.com/1c584e6e-eb7c-464a-a546-71ae8a633ab8")
+
+def ping(suffix=""):
+    """Ping healthcheck. suffix='/fail' marks the check failed (turns red)."""
+    if not HC_PING_URL:
+        return
+    try:
+        requests.get(HC_PING_URL + suffix, timeout=10)
+    except Exception:
+        pass  # never let a ping failure break the poll loop
 
 # BST sheet — 1Sp0Zo7j9a-73R4kYV-2MSQzXUb8BmlDD0hcCcTUcC1E
 # Tabs: "BST Form Meta", "BST Website"
@@ -196,6 +206,8 @@ def send_w0(phone: str, first_name: str, template: str) -> bool:
             return True
         else:
             log.error(f"WATI {r.status_code} for {formatted}: {r.text[:200]}")
+            if r.status_code in (401, 403):
+                ping("/fail")  # auth dead — turn healthcheck red so we get alerted
             return False
     except Exception as e:
         log.error(f"WATI request failed for {formatted}: {e}")
@@ -253,10 +265,16 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
         # Get name — first word only
         raw_name = str(row[name_col]).strip() if len(row) > name_col else ""
         if not raw_name or raw_name.lower() in ("not found", "nan", ""):
-            raw_name = "there"
-        if full_name or " " in raw_name:
-            raw_name = raw_name.split()[0]
-        first_name = raw_name.title()
+            first_name = "there"
+        elif "@" in raw_name:
+            first_name = "there"  # email landed in name field — bad form data
+        elif " " in raw_name:
+            first_name = raw_name.split()[0].title()
+        elif full_name:
+            m = re.match(r"[A-Z][a-z]+", raw_name)  # camelCase FirstSurname
+            first_name = (m.group(0) if m else raw_name).title()
+        else:
+            first_name = raw_name.title()
 
         if send_w0(raw_phone, first_name, template):
             fired += 1
@@ -286,6 +304,7 @@ def main():
                 fired = poll_tab(service, tab_cfg, seen)
                 total_fired += fired
             save_seen(seen)
+            ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
                 log.info(f"Cycle complete — {total_fired} W0 message(s) sent total")
         except Exception as e:
