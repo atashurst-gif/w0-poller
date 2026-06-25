@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 
 WATI_API_URL  = os.getenv("WATI_API_URL", "https://eu-api.wati.io/602557")
 WATI_TOKEN    = os.getenv("WATI_TOKEN", "")
+WATI_API_URL_DECLAN = os.getenv("WATI_API_URL_DECLAN", "")
+WATI_TOKEN_DECLAN   = os.getenv("WATI_TOKEN_DECLAN", "")
 POLL_INTERVAL = int(os.getenv("W0_POLL_INTERVAL", "60"))
 SEEN_FILE     = os.getenv("W0_SEEN_FILE", "w0_seen.json")
 HC_PING_URL   = os.getenv("HC_PING_URL", "https://hc-ping.com/1c584e6e-eb7c-464a-a546-71ae8a633ab8")
@@ -178,15 +180,17 @@ def is_valid_phone(phone: str) -> bool:
 # WATI send
 # ─────────────────────────────────────────────
 
-def send_w0(phone: str, first_name: str, template: str) -> bool:
+def send_w0(phone: str, first_name: str, template: str, api_url: str = None, token: str = None) -> bool:
     formatted = format_phone(phone)
     if not is_valid_phone(formatted):
         log.warning(f"Skipping invalid phone: {phone!r}")
         return False
 
-    url = f"{WATI_API_URL}/api/v2/sendTemplateMessages"
+    api_url = api_url or WATI_API_URL    # default: Regen's WATI
+    token   = token   or WATI_TOKEN      # default: Regen's WATI
+    url = f"{api_url}/api/v2/sendTemplateMessages"
     headers = {
-        "Authorization": f"Bearer {WATI_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -276,7 +280,19 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
         else:
             first_name = raw_name.title()
 
-        if send_w0(raw_phone, first_name, template):
+        # ROUTING: BST Form Meta rows with Creative=="Bailiff Companies" are
+        # Declan's (MDH) — fire bst_w0 via Declan's WATI, NOT Regen's. All
+        # other rows/tabs are unchanged and use Regen's WATI as before.
+        creative = (str(row[2]).strip().lower() if len(row) > 2 and row[2] else "")
+        if tab == "BST Form Meta" and creative == "bailiff companies":
+            if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
+                log.error(f"Bailiff Companies lead {raw_phone} but Declan WATI env not set — SKIPPING (not sending via Regen)")
+                continue
+            sent = send_w0(raw_phone, first_name, "bst_w0",
+                           api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        else:
+            sent = send_w0(raw_phone, first_name, template)
+        if sent:
             fired += 1
         time.sleep(0.5)  # gentle pacing
 
