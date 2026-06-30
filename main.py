@@ -112,6 +112,18 @@ WATCH_TABS = [
         "name_col":    2,
         "skip_rows":   1,
     },
+    # UKDTCTD1 (Dec) — Declan's UKDT source: Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
+    # Whole tab routes to DECLAN's WATI with ukdt_ct_w0 (NOT Regen's).
+    {
+        "sheet_id":    UKDT_SHEET_ID,
+        "tab":         "UKDTCTD1 (Dec)",
+        "template":    "ukdt_ct_w0",
+        "phone_col":   5,
+        "name_col":    3,
+        "skip_rows":   1,
+        "full_name":   True,
+        "wati":        "declan",
+    },
 ]
 
 # ─────────────────────────────────────────────
@@ -280,15 +292,18 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
         else:
             first_name = raw_name.title()
 
-        # ROUTING: BST Form Meta rows with Creative=="Bailiff Companies" are
-        # Declan's (MDH) — fire bst_w0 via Declan's WATI, NOT Regen's. All
-        # other rows/tabs are unchanged and use Regen's WATI as before.
+        # ROUTING to Declan's (MDH) WATI — two cases:
+        #  (a) whole-tab Declan sources via tab_cfg "wati"=="declan"
+        #  (b) BST Form Meta rows with Creative=="Bailiff Companies"
+        # Everything else is unchanged and uses Regen's WATI as before.
         creative = (str(row[2]).strip().lower() if len(row) > 2 and row[2] else "")
-        if tab == "BST Form Meta" and creative == "bailiff companies":
+        route_declan = (tab_cfg.get("wati") == "declan") or \
+                       (tab == "BST Form Meta" and creative == "bailiff companies")
+        if route_declan:
             if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
-                log.error(f"Bailiff Companies lead {raw_phone} but Declan WATI env not set — SKIPPING (not sending via Regen)")
+                log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
                 continue
-            sent = send_w0(raw_phone, first_name, "bst_w0",
+            sent = send_w0(raw_phone, first_name, template,
                            api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
         else:
             sent = send_w0(raw_phone, first_name, template)
