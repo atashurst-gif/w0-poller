@@ -12,6 +12,7 @@ import time
 import base64
 import logging
 import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -59,6 +60,43 @@ BST_TEMPLATE   = "bst_nc0"
 # Tabs: "UKDT CT", "UKDT CTWA 1%", "UKDT WEBSITE"
 UKDT_SHEET_ID  = os.getenv("UKDT_SHEET_ID", "11lc2uiVgJrKE_tQE5BE-JdsMT9kdjCfXnyGOoxLw0CA")
 UKDT_TEMPLATE  = "ukdt_w0"
+
+# ── Out-of-hours booking gate ──────────────────
+UK_TZ = ZoneInfo("Europe/London")
+W0W_MAP         = {"ukdt_w0": "ukdt_w0w", "bst_nc0": "bst_w0w"}
+LEAD_SOURCE_MAP = {"ukdt_w0": "ukdt",     "bst_nc0": "bst"}
+
+def is_out_of_hours(now=None) -> bool:
+    now = now or datetime.datetime.now(UK_TZ)
+    wd, hr = now.weekday(), now.hour
+    if wd <= 3:            return hr >= 18
+    if wd == 4:            return hr >= 14
+    return True
+
+def booking_window_for(now=None) -> str:
+    now = now or datetime.datetime.now(UK_TZ)
+    wd = now.weekday()
+    if wd in (4, 5): return "mon"
+    if wd == 6:      return "montue"
+    return "evening2"
+
+def set_lead_attributes(phone: str, lead_source: str, booking_window: str) -> bool:
+    formatted = format_phone(phone)
+    url = f"{WATI_API_URL}/api/v1/updateContactAttributes/{formatted}"
+    headers = {"Authorization": f"Bearer {WATI_TOKEN}", "Content-Type": "application/json"}
+    payload = {"customParams": [
+        {"name": "lead_source",    "value": lead_source},
+        {"name": "booking_window", "value": booking_window},
+    ]}
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code in (200, 201):
+            return True
+        log.error(f"attr-set {r.status_code} for {formatted}: {r.text[:200]}")
+        return False
+    except Exception as e:
+        log.error(f"attr-set failed for {formatted}: {e}")
+        return False
 
 # Tabs to watch per sheet — (sheet_id, tab_name, phone_col_index, name_col_index, skip_rows)
 # phone_col_index / name_col_index = 0-based column index
@@ -306,7 +344,14 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
             sent = send_w0(raw_phone, first_name, template,
                            api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
         else:
-            sent = send_w0(raw_phone, first_name, template)
+            if is_out_of_hours() and template in W0W_MAP:
+                w0w_template   = W0W_MAP[template]
+                lead_source    = LEAD_SOURCE_MAP[template]
+                booking_window = booking_window_for()
+                set_lead_attributes(raw_phone, lead_source, booking_window)
+                sent = send_w0(raw_phone, first_name, w0w_template)
+            else:
+                sent = send_w0(raw_phone, first_name, template)
         if sent:
             fired += 1
         time.sleep(0.5)  # gentle pacing
