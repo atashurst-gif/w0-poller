@@ -39,6 +39,7 @@ WATI_TOKEN    = os.getenv("WATI_TOKEN", "")
 WATI_API_URL_DECLAN = os.getenv("WATI_API_URL_DECLAN", "")
 WATI_TOKEN_DECLAN   = os.getenv("WATI_TOKEN_DECLAN", "")
 POLL_INTERVAL = int(os.getenv("W0_POLL_INTERVAL", "60"))
+MAX_ATTEMPTS  = int(os.getenv("W0_MAX_ATTEMPTS", "5"))  # retry a failed send up to N times before giving up
 SEEN_FILE     = os.getenv("W0_SEEN_FILE", "w0_seen.json")
 HC_PING_URL   = os.getenv("HC_PING_URL", "https://hc-ping.com/1c584e6e-eb7c-464a-a546-71ae8a633ab8")
 
@@ -189,10 +190,21 @@ def get_sheets_service():
 def load_seen() -> dict:
     if Path(SEEN_FILE).exists():
         with open(SEEN_FILE) as f:
-            return json.load(f)
+            raw = json.load(f)
+        # Migrate legacy format {key: int} -> {key: {"count": int, "failed": []}}
+        migrated = {}
+        for k, v in raw.items():
+            if isinstance(v, int):
+                migrated[k] = {"count": v, "failed": []}
+            elif isinstance(v, dict):
+                migrated[k] = {"count": v.get("count", 0), "failed": v.get("failed", [])}
+            else:
+                migrated[k] = {"count": 0, "failed": []}
+        return migrated
     return {}
 
 def save_seen(seen: dict):
+    # Format: {"<sheet_id>::<tab>": {"count": int, "failed": [{"idx": int, "attempts": int, "phone": str}]}}
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, indent=2)
 
@@ -230,11 +242,15 @@ def is_valid_phone(phone: str) -> bool:
 # WATI send
 # ─────────────────────────────────────────────
 
-def send_w0(phone: str, first_name: str, template: str, api_url: str = None, token: str = None) -> bool:
+def send_w0(phone: str, first_name: str, template: str, api_url: str = None, token: str = None) -> str:
+    """Returns a status string: 'ok' | 'dead' | 'retry'.
+       'ok'    = sent (200/201, number valid)
+       'dead'  = permanent fail, do NOT retry (invalid number / bad request that won't fix itself)
+       'retry' = transient fail, safe to retry next cycle (timeout, 429, 5xx, auth)"""
     formatted = format_phone(phone)
     if not is_valid_phone(formatted):
         log.warning(f"Skipping invalid phone: {phone!r}")
-        return False
+        return "dead"
 
     api_url = api_url or WATI_API_URL    # default: Regen's WATI
     token   = token   or WATI_TOKEN      # default: Regen's WATI
@@ -256,29 +272,89 @@ def send_w0(phone: str, first_name: str, template: str, api_url: str = None, tok
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=30)
         if r.status_code in (200, 201):
+            # 200 doesn't always mean delivered — WATI can 200 with isValidWhatsAppNumber:false
+            try:
+                body = r.json()
+                receivers = body.get("receivers") or []
+                if receivers and receivers[0].get("isValidWhatsAppNumber") is False:
+                    log.warning(f"WATI 200 but invalid WhatsApp number {formatted} — marking dead")
+                    return "dead"
+            except Exception:
+                pass  # unparseable 200 — treat as ok, don't retry-loop
             log.info(f"✓ W0 sent [{template}] → {formatted} ({first_name})")
-            return True
+            return "ok"
         else:
             log.error(f"WATI {r.status_code} for {formatted}: {r.text[:200]}")
             if r.status_code in (401, 403):
                 ping("/fail")  # auth dead — turn healthcheck red so we get alerted
-            return False
+                return "retry"  # token may recover / be refreshed — don't lose the lead
+            if r.status_code == 400:
+                return "retry"  # your incident: transient 400 on approved template — retry
+            if r.status_code == 429 or r.status_code >= 500:
+                return "retry"  # throttle / server error — retry
+            return "dead"       # other 4xx (404 etc.) won't fix on retry
     except Exception as e:
         log.error(f"WATI request failed for {formatted}: {e}")
-        return False
+        return "retry"  # network blip / timeout — retry
 
 # ─────────────────────────────────────────────
 # Poll one tab
 # ─────────────────────────────────────────────
 
-def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
-    sheet_id  = tab_cfg["sheet_id"]
+def _extract_first_name(raw_name: str, full_name: bool) -> str:
+    raw_name = str(raw_name).strip()
+    if not raw_name or raw_name.lower() in ("not found", "nan", ""):
+        return "there"
+    if "@" in raw_name:
+        return "there"  # email landed in name field — bad form data
+    if " " in raw_name:
+        return raw_name.split()[0].title()
+    if full_name:
+        m = re.match(r"[A-Z][a-z]+", raw_name)  # camelCase FirstSurname
+        return (m.group(0) if m else raw_name).title()
+    return raw_name.title()
+
+def _send_for_row(row: list, tab_cfg: dict) -> str:
+    """Resolve routing + out-of-hours for a single row and send.
+       Returns send_w0 status ('ok'|'dead'|'retry') or 'skip' if the row is unsendable."""
     tab       = tab_cfg["tab"]
     template  = tab_cfg["template"]
     phone_col = tab_cfg["phone_col"]
     name_col  = tab_cfg["name_col"]
-    skip      = tab_cfg.get("skip_rows", 1)
     full_name = tab_cfg.get("full_name", False)
+
+    if len(row) <= phone_col:
+        return "skip"
+    raw_phone = str(row[phone_col]).strip()
+    if not raw_phone or raw_phone.lower() in ("", "not found", "nan"):
+        return "skip"
+
+    first_name = _extract_first_name(row[name_col] if len(row) > name_col else "", full_name)
+
+    # ROUTING to Declan's (MDH) WATI — two cases:
+    #  (a) whole-tab Declan sources via tab_cfg "wati"=="declan"
+    #  (b) BST Form Meta rows with Creative=="Bailiff Companies"
+    creative = (str(row[2]).strip().lower() if len(row) > 2 and row[2] else "")
+    route_declan = (tab_cfg.get("wati") == "declan") or \
+                   (tab == "BST Form Meta" and creative == "bailiff companies")
+    if route_declan:
+        if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
+            log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
+            return "skip"
+        return send_w0(raw_phone, first_name, template,
+                       api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+    if is_out_of_hours() and template in W0W_MAP:
+        w0w_template   = W0W_MAP[template]
+        lead_source    = LEAD_SOURCE_MAP[template]
+        booking_window = booking_window_for()
+        set_lead_attributes(raw_phone, lead_source, booking_window)
+        return send_w0(raw_phone, first_name, w0w_template)
+    return send_w0(raw_phone, first_name, template)
+
+def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
+    sheet_id  = tab_cfg["sheet_id"]
+    tab       = tab_cfg["tab"]
+    skip      = tab_cfg.get("skip_rows", 1)
 
     key = seen_key(sheet_id, tab)
 
@@ -297,68 +373,68 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
 
     # First run — record current count, fire nothing (don't spam existing data)
     if key not in seen:
-        seen[key] = total
+        seen[key] = {"count": total, "failed": []}
         log.info(f"{tab}: first run, seeding at row {total}")
         return 0
 
-    prev_count = seen[key]
-    if total <= prev_count:
-        return 0
-
-    new_rows = data_rows[prev_count:]
+    entry = seen[key]
+    prev_count = entry["count"]
     fired = 0
 
-    for row in new_rows:
-        # Get phone
-        if len(row) <= phone_col:
-            continue
-        raw_phone = str(row[phone_col]).strip()
-        if not raw_phone or raw_phone.lower() in ("", "not found", "nan"):
-            continue
-
-        # Get name — first word only
-        raw_name = str(row[name_col]).strip() if len(row) > name_col else ""
-        if not raw_name or raw_name.lower() in ("not found", "nan", ""):
-            first_name = "there"
-        elif "@" in raw_name:
-            first_name = "there"  # email landed in name field — bad form data
-        elif " " in raw_name:
-            first_name = raw_name.split()[0].title()
-        elif full_name:
-            m = re.match(r"[A-Z][a-z]+", raw_name)  # camelCase FirstSurname
-            first_name = (m.group(0) if m else raw_name).title()
-        else:
-            first_name = raw_name.title()
-
-        # ROUTING to Declan's (MDH) WATI — two cases:
-        #  (a) whole-tab Declan sources via tab_cfg "wati"=="declan"
-        #  (b) BST Form Meta rows with Creative=="Bailiff Companies"
-        # Everything else is unchanged and uses Regen's WATI as before.
-        creative = (str(row[2]).strip().lower() if len(row) > 2 and row[2] else "")
-        route_declan = (tab_cfg.get("wati") == "declan") or \
-                       (tab == "BST Form Meta" and creative == "bailiff companies")
-        if route_declan:
-            if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
-                log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
+    # ── Retry previously-failed rows first (re-read fresh by absolute index) ──
+    still_failed = []
+    phone_col = tab_cfg["phone_col"]
+    for f in entry.get("failed", []):
+        idx = f["idx"]
+        want_phone = f.get("phone", "")
+        # Verify the row at idx is still the same lead — sheet may have shifted (insert/delete above)
+        if idx >= total or (want_phone and (len(data_rows[idx]) <= phone_col or str(data_rows[idx][phone_col]).strip() != want_phone)):
+            # Re-scan for the phone across the sheet
+            found = None
+            if want_phone:
+                for j, r in enumerate(data_rows):
+                    if len(r) > phone_col and str(r[phone_col]).strip() == want_phone:
+                        found = j
+                        break
+            if found is None:
+                log.warning(f"{tab}: failed row (phone {want_phone or '?'}) no longer locatable — dropping")
                 continue
-            sent = send_w0(raw_phone, first_name, template,
-                           api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
-        else:
-            if is_out_of_hours() and template in W0W_MAP:
-                w0w_template   = W0W_MAP[template]
-                lead_source    = LEAD_SOURCE_MAP[template]
-                booking_window = booking_window_for()
-                set_lead_attributes(raw_phone, lead_source, booking_window)
-                sent = send_w0(raw_phone, first_name, w0w_template)
-            else:
-                sent = send_w0(raw_phone, first_name, template)
-        if sent:
+            log.info(f"{tab}: failed row moved {idx}->{found} (sheet shifted) — retrying at new index")
+            idx = found
+        status = _send_for_row(data_rows[idx], tab_cfg)
+        if status == "ok":
             fired += 1
-        time.sleep(0.5)  # gentle pacing
+            log.info(f"{tab}: retry OK for row idx {idx} (attempt {f['attempts']+1})")
+        elif status == "skip" or status == "dead":
+            log.warning(f"{tab}: dropping row idx {idx} — status={status} after {f['attempts']} attempt(s)")
+        else:  # retry
+            attempts = f["attempts"] + 1
+            if attempts >= MAX_ATTEMPTS:
+                log.error(f"{tab}: row idx {idx} hit MAX_ATTEMPTS ({MAX_ATTEMPTS}) — giving up, lead dropped")
+            else:
+                still_failed.append({"idx": idx, "attempts": attempts, "phone": f.get("phone", "")})
+        time.sleep(0.5)
 
-    seen[key] = total
+    # ── Process genuinely new rows ──
+    if total > prev_count:
+        for offset, row in enumerate(data_rows[prev_count:]):
+            idx = prev_count + offset
+            status = _send_for_row(row, tab_cfg)
+            if status == "ok":
+                fired += 1
+            elif status == "retry":
+                ph = str(row[tab_cfg["phone_col"]]).strip() if len(row) > tab_cfg["phone_col"] else ""
+                still_failed.append({"idx": idx, "attempts": 1, "phone": ph})
+                log.warning(f"{tab}: new row idx {idx} failed (transient) — queued for retry")
+            # 'dead' / 'skip' — do nothing, not retried
+            time.sleep(0.5)
+
+    entry["count"]  = total
+    entry["failed"] = still_failed
     if fired:
-        log.info(f"{tab}: {fired} W0 message(s) sent ({total - prev_count} new rows)")
+        log.info(f"{tab}: {fired} W0 message(s) sent")
+    if still_failed:
+        log.info(f"{tab}: {len(still_failed)} row(s) queued for retry next cycle")
     return fired
 
 # ─────────────────────────────────────────────
