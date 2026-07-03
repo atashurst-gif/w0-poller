@@ -56,6 +56,7 @@ def ping(suffix=""):
 # Tabs: "BST Form Meta", "BST Website"
 BST_SHEET_ID   = os.getenv("BST_SHEET_ID", "1Sp0Zo7j9a-73R4kYV-2MSQzXUb8BmlDD0hcCcTUcC1E")
 BST_TEMPLATE   = "bst_nc0"
+BST_TEMPLATE_DECLAN = "bst_w0"   # Declan tenant uses bst_w0, not bst_nc0
 
 # UKDT sheet — 11lc2uiVgJrKE_tQE5BE-JdsMT9kdjCfXnyGOoxLw0CA
 # Tabs: "UKDT CT", "UKDT CTWA 1%", "UKDT WEBSITE"
@@ -334,7 +335,8 @@ def _send_for_row(row: list, tab_cfg: dict) -> str:
         if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
             log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
             return "skip"
-        return send_w0(raw_phone, first_name, template,
+        declan_template = BST_TEMPLATE_DECLAN if tab == "BST Form Meta" else template
+        return send_w0(raw_phone, first_name, declan_template,
                        api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
     if is_out_of_hours() and template in W0W_MAP:
         w0w_template   = W0W_MAP[template]
