@@ -76,9 +76,9 @@ def is_out_of_hours(now=None) -> bool:
 def booking_window_for(now=None) -> str:
     now = now or datetime.datetime.now(UK_TZ)
     wd = now.weekday()
-    if wd in (4, 5): return "mon"
-    if wd == 6:      return "montue"
-    return "evening2"
+    if wd in (4, 5): return "callbacks-monday"    # Fri/Sat -> Monday
+    if wd == 6:      return "callbacks-suntue"     # Sun -> Mon+Tue
+    return "callbacks-monday"                       # Mon-Thu eve -> Monday (until rolling event)
 
 def set_lead_attributes(phone: str, lead_source: str, booking_window: str) -> bool:
     formatted = format_phone(phone)
