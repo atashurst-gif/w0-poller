@@ -272,15 +272,8 @@ def send_w0(phone: str, first_name: str, template: str, api_url: str = None, tok
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=30)
         if r.status_code in (200, 201):
-            # 200 doesn't always mean delivered — WATI can 200 with isValidWhatsAppNumber:false
-            try:
-                body = r.json()
-                receivers = body.get("receivers") or []
-                if receivers and receivers[0].get("isValidWhatsAppNumber") is False:
-                    log.warning(f"WATI 200 but invalid WhatsApp number {formatted} — marking dead")
-                    return "dead"
-            except Exception:
-                pass  # unparseable 200 — treat as ok, don't retry-loop
+            # WATI's isValidWhatsAppNumber flag is unreliable (returns false even when the
+            # message delivers), so we trust the HTTP status, not the body. A 200 = accepted.
             log.info(f"✓ W0 sent [{template}] → {formatted} ({first_name})")
             return "ok"
         else:
