@@ -75,12 +75,15 @@ def is_out_of_hours(now=None) -> bool:
     if wd == 4:            return hr >= 14
     return True
 
-def booking_window_for(now=None) -> str:
+def booking_window_for(now=None, lead_source: str = "ukdt") -> str:
     now = now or datetime.datetime.now(UK_TZ)
     wd = now.weekday()
-    if wd in (4, 5): return "callbacks-monday"    # Fri/Sat -> Monday
-    if wd == 6:      return "callbacks-suntue"     # Sun -> Mon+Tue
-    return "callbacks-monday"                       # Mon-Thu eve -> Monday (until rolling event)
+    brand = (lead_source or "").strip().lower()
+    if brand == "bst":
+        if wd == 6:      return "callbacks-sunday-bst"  # Sun -> BST Sunday event
+        return "callbacks-monday-bst"                   # Fri/Sat/evenings -> BST Monday event
+    if wd == 6:          return "callbacks-suntue"       # Sun -> Mon+Tue
+    return "callbacks-monday"                            # Fri/Sat/evenings -> Monday
 
 def set_lead_attributes(phone: str, lead_source: str, booking_window: str) -> bool:
     formatted = format_phone(phone)
@@ -341,7 +344,7 @@ def _send_for_row(row: list, tab_cfg: dict) -> str:
     if is_out_of_hours() and template in W0W_MAP:
         w0w_template   = W0W_MAP[template]
         lead_source    = LEAD_SOURCE_MAP[template]
-        booking_window = booking_window_for()
+        booking_window = booking_window_for(lead_source=lead_source)
         set_lead_attributes(raw_phone, lead_source, booking_window)
         return send_w0(raw_phone, first_name, w0w_template)
     return send_w0(raw_phone, first_name, template)
