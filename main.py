@@ -74,6 +74,8 @@ UKDT_SHEET_ID  = os.getenv("UKDT_SHEET_ID", "11lc2uiVgJrKE_tQE5BE-JdsMT9kdjCfXny
 UKDT_TEMPLATE  = "ukdt_w0"
 AUTOMATION_SHEET_ID = os.getenv("AUTOMATION_SHEET_ID", "1bggrSflZQa3ZCng6TQXbf1vNrnQWDnOBZcjDoCcjdf4")
 AUTOMATION_TAB = os.getenv("AUTOMATION_TAB", "Sheet1")
+W0_TRACKING_SHEET_ID = os.getenv("W0_TRACKING_SHEET_ID", AUTOMATION_SHEET_ID)
+W0_TRACKING_TAB = os.getenv("W0_TRACKING_TAB", "W0 Tracking")
 BOOKING_PENDING_STATUS = "booking pending"
 SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST"}
 STOPPED_SEQUENCE_STATUSES = {
@@ -120,6 +122,53 @@ def set_lead_attributes(phone: str, lead_source: str, booking_window: str) -> bo
         return False
     except Exception as e:
         log.error(f"attr-set failed for {formatted}: {e}")
+        return False
+
+
+def ensure_w0_tracking_sheet(service):
+    meta = service.spreadsheets().get(spreadsheetId=W0_TRACKING_SHEET_ID).execute()
+    tabs = [s['properties']['title'] for s in meta.get('sheets', [])]
+    if W0_TRACKING_TAB not in tabs:
+        log.info(f"Creating '{W0_TRACKING_TAB}' tab...")
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=W0_TRACKING_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": W0_TRACKING_TAB}}}]}
+        ).execute()
+        service.spreadsheets().values().append(
+            spreadsheetId=W0_TRACKING_SHEET_ID,
+            range=f"'{W0_TRACKING_TAB}'!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[
+                "Sent At", "TL-REF", "First Name", "Phone", "Campaign", "Status"
+            ]]}
+        ).execute()
+        log.info(f"'{W0_TRACKING_TAB}' created.")
+
+
+def append_w0_tracking_row(service, phone: str, first_name: str, campaign: str, status: str, now=None) -> bool:
+    now = now or datetime.datetime.now(UK_TZ)
+    formatted = format_phone(phone)
+    tl_ref = f"W0-{campaign.upper().replace(' ', '-')}-{now.strftime('%Y%m%d%H%M%S')}-{formatted[-4:]}"
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=W0_TRACKING_SHEET_ID,
+            range=f"'{W0_TRACKING_TAB}'!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[
+                now.strftime("%d/%m/%Y %H:%M"),
+                tl_ref,
+                first_name or "there",
+                formatted,
+                campaign,
+                status,
+            ]]}
+        ).execute()
+        log.info(f"{formatted}: added to {W0_TRACKING_TAB} as {status} ({campaign})")
+        return True
+    except Exception as e:
+        log.error(f"{formatted}: failed to add W0 tracking row: {e}")
         return False
 
 # Tabs to watch per sheet — (sheet_id, tab_name, phone_col_index, name_col_index, skip_rows)
@@ -275,44 +324,7 @@ def append_booking_pending_lead(service, phone: str, first_name: str, lead_sourc
     if not campaign:
         log.warning(f"No sequence campaign mapped for lead_source={lead_source!r}")
         return False
-
-    formatted = format_phone(phone)
-    now = now or datetime.datetime.now(UK_TZ)
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=AUTOMATION_SHEET_ID,
-            range=f"'{AUTOMATION_TAB}'!A:F",
-        ).execute()
-        rows = result.get("values", [])
-        for row in rows[1:]:
-            row_phone = row[3] if len(row) > 3 else ""
-            row_status = row[5] if len(row) > 5 else ""
-            if format_phone(row_phone) == formatted and not is_stopped_sequence_status(row_status):
-                log.info(f"{formatted}: already active in WATI sequence sheet, not duplicating")
-                return True
-
-        tl_ref = f"W0-{lead_source.upper()}-{now.strftime('%Y%m%d%H%M%S')}-{formatted[-4:]}"
-        row = [
-            now.strftime("%d/%m/%Y %H:%M"),
-            tl_ref,
-            first_name or "there",
-            formatted,
-            campaign,
-            BOOKING_PENDING_STATUS,
-        ]
-        service.spreadsheets().values().append(
-            spreadsheetId=AUTOMATION_SHEET_ID,
-            range=f"'{AUTOMATION_TAB}'!A1",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [row]},
-        ).execute()
-        log.info(f"{formatted}: added to WATI sequence as booking pending ({campaign})")
-        return True
-    except Exception as e:
-        log.error(f"{formatted}: failed to add booking-pending sequence row: {e}")
-        ping("/fail")
-        return False
+    return append_w0_tracking_row(service, phone, first_name, campaign, BOOKING_PENDING_STATUS, now=now)
 
 # ─────────────────────────────────────────────
 # WATI send
@@ -422,7 +434,11 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         if status == "ok" and service:
             append_booking_pending_lead(service, raw_phone, first_name, lead_source)
         return status
-    return send_w0(raw_phone, first_name, template)
+    status = send_w0(raw_phone, first_name, template)
+    if status == "ok" and service:
+        lead_source = LEAD_SOURCE_MAP.get(template, template.replace("_w0", "")).upper()
+        append_w0_tracking_row(service, raw_phone, first_name, lead_source, "w0 sent")
+    return status
 
 def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
     sheet_id  = tab_cfg["sheet_id"]
@@ -524,6 +540,7 @@ def main():
     while True:
         try:
             service = get_sheets_service()
+            ensure_w0_tracking_sheet(service)
             total_fired = 0
             for tab_cfg in WATCH_TABS:
                 fired = poll_tab(service, tab_cfg, seen)
