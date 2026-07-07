@@ -11,6 +11,7 @@ import json
 import time
 import base64
 import logging
+import sys
 import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -26,7 +27,7 @@ from googleapiclient.discovery import build
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
 
@@ -40,8 +41,17 @@ WATI_API_URL_DECLAN = os.getenv("WATI_API_URL_DECLAN", "")
 WATI_TOKEN_DECLAN   = os.getenv("WATI_TOKEN_DECLAN", "")
 POLL_INTERVAL = int(os.getenv("W0_POLL_INTERVAL", "60"))
 MAX_ATTEMPTS  = int(os.getenv("W0_MAX_ATTEMPTS", "5"))  # retry a failed send up to N times before giving up
-SEEN_FILE     = os.getenv("W0_SEEN_FILE", "w0_seen.json")
 HC_PING_URL   = os.getenv("HC_PING_URL", "https://hc-ping.com/1c584e6e-eb7c-464a-a546-71ae8a633ab8")
+
+def default_seen_file() -> str:
+    volume_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
+    if volume_path:
+        return str(Path(volume_path) / "w0_seen.json")
+    if Path("/data").exists():
+        return "/data/w0_seen.json"
+    return "w0_seen.json"
+
+SEEN_FILE = os.getenv("W0_SEEN_FILE") or default_seen_file()
 
 def ping(suffix=""):
     """Ping healthcheck. suffix='/fail' marks the check failed (turns red)."""
@@ -62,6 +72,15 @@ BST_TEMPLATE_DECLAN = "bst_w0"   # Declan tenant uses bst_w0, not bst_nc0
 # Tabs: "UKDT CT", "UKDT CTWA 1%", "UKDT WEBSITE"
 UKDT_SHEET_ID  = os.getenv("UKDT_SHEET_ID", "11lc2uiVgJrKE_tQE5BE-JdsMT9kdjCfXnyGOoxLw0CA")
 UKDT_TEMPLATE  = "ukdt_w0"
+AUTOMATION_SHEET_ID = os.getenv("AUTOMATION_SHEET_ID", "1bggrSflZQa3ZCng6TQXbf1vNrnQWDnOBZcjDoCcjdf4")
+AUTOMATION_TAB = os.getenv("AUTOMATION_TAB", "Sheet1")
+BOOKING_PENDING_STATUS = "booking pending"
+SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST"}
+STOPPED_SEQUENCE_STATUSES = {
+    "replied", "completed", "opted out", "converted", "do not contact",
+    "dnc", "dnq", "callback", "interested", "agreed", "lead passed",
+    "verified", "moc set", "moc approved", "cbna",
+}
 
 # ── Out-of-hours booking gate ──────────────────
 UK_TZ = ZoneInfo("Europe/London")
@@ -183,9 +202,9 @@ def get_sheets_service():
             sa_dict = json.load(f)
     creds = Credentials.from_service_account_info(
         sa_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
-    return build("sheets", "v4", credentials=creds)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 # ─────────────────────────────────────────────
 # Seen-row tracking (persisted to disk)
@@ -209,6 +228,9 @@ def load_seen() -> dict:
 
 def save_seen(seen: dict):
     # Format: {"<sheet_id>::<tab>": {"count": int, "failed": [{"idx": int, "attempts": int, "phone": str}]}}
+    path = Path(SEEN_FILE)
+    if path.parent and str(path.parent) != ".":
+        path.parent.mkdir(parents=True, exist_ok=True)
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, indent=2)
 
@@ -241,6 +263,56 @@ def format_phone(raw: str) -> str:
 def is_valid_phone(phone: str) -> bool:
     digits = re.sub(r"\D", "", phone)
     return len(digits) >= 10
+
+
+def is_stopped_sequence_status(status: str) -> bool:
+    status = (status or "").lower()
+    return any(s in status for s in STOPPED_SEQUENCE_STATUSES)
+
+
+def append_booking_pending_lead(service, phone: str, first_name: str, lead_source: str, now=None) -> bool:
+    campaign = SEQUENCE_CAMPAIGN_MAP.get((lead_source or "").lower())
+    if not campaign:
+        log.warning(f"No sequence campaign mapped for lead_source={lead_source!r}")
+        return False
+
+    formatted = format_phone(phone)
+    now = now or datetime.datetime.now(UK_TZ)
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=AUTOMATION_SHEET_ID,
+            range=f"'{AUTOMATION_TAB}'!A:F",
+        ).execute()
+        rows = result.get("values", [])
+        for row in rows[1:]:
+            row_phone = row[3] if len(row) > 3 else ""
+            row_status = row[5] if len(row) > 5 else ""
+            if format_phone(row_phone) == formatted and not is_stopped_sequence_status(row_status):
+                log.info(f"{formatted}: already active in WATI sequence sheet, not duplicating")
+                return True
+
+        tl_ref = f"W0-{lead_source.upper()}-{now.strftime('%Y%m%d%H%M%S')}-{formatted[-4:]}"
+        row = [
+            now.strftime("%d/%m/%Y %H:%M"),
+            tl_ref,
+            first_name or "there",
+            formatted,
+            campaign,
+            BOOKING_PENDING_STATUS,
+        ]
+        service.spreadsheets().values().append(
+            spreadsheetId=AUTOMATION_SHEET_ID,
+            range=f"'{AUTOMATION_TAB}'!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+        log.info(f"{formatted}: added to WATI sequence as booking pending ({campaign})")
+        return True
+    except Exception as e:
+        log.error(f"{formatted}: failed to add booking-pending sequence row: {e}")
+        ping("/fail")
+        return False
 
 # ─────────────────────────────────────────────
 # WATI send
@@ -311,7 +383,7 @@ def _extract_first_name(raw_name: str, full_name: bool) -> str:
         return (m.group(0) if m else raw_name).title()
     return raw_name.title()
 
-def _send_for_row(row: list, tab_cfg: dict) -> str:
+def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     """Resolve routing + out-of-hours for a single row and send.
        Returns send_w0 status ('ok'|'dead'|'retry') or 'skip' if the row is unsendable."""
     tab       = tab_cfg["tab"]
@@ -346,7 +418,10 @@ def _send_for_row(row: list, tab_cfg: dict) -> str:
         lead_source    = LEAD_SOURCE_MAP[template]
         booking_window = booking_window_for(lead_source=lead_source)
         set_lead_attributes(raw_phone, lead_source, booking_window)
-        return send_w0(raw_phone, first_name, w0w_template)
+        status = send_w0(raw_phone, first_name, w0w_template)
+        if status == "ok" and service:
+            append_booking_pending_lead(service, raw_phone, first_name, lead_source)
+        return status
     return send_w0(raw_phone, first_name, template)
 
 def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
@@ -399,7 +474,7 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
                 continue
             log.info(f"{tab}: failed row moved {idx}->{found} (sheet shifted) — retrying at new index")
             idx = found
-        status = _send_for_row(data_rows[idx], tab_cfg)
+        status = _send_for_row(data_rows[idx], tab_cfg, service)
         if status == "ok":
             fired += 1
             log.info(f"{tab}: retry OK for row idx {idx} (attempt {f['attempts']+1})")
@@ -417,7 +492,7 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
     if total > prev_count:
         for offset, row in enumerate(data_rows[prev_count:]):
             idx = prev_count + offset
-            status = _send_for_row(row, tab_cfg)
+            status = _send_for_row(row, tab_cfg, service)
             if status == "ok":
                 fired += 1
             elif status == "retry":
