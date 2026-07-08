@@ -118,14 +118,15 @@ def booking_window_for(now=None, lead_source: str = "ukdt") -> str:
     if is_weekday_evening: return "callbacks-nextday"      # Mon-Thu eve -> next day
     return "callbacks-monday"                              # safety fallback -> Monday
 
-def set_lead_attributes(phone: str, lead_source: str, booking_window: str, booking_url: str = "") -> bool:
+def set_lead_attributes(phone: str, lead_source: str, booking_window: str = "", booking_url: str = "") -> bool:
     formatted = format_phone(phone)
     url = f"{WATI_API_URL}/api/v1/updateContactAttributes/{formatted}"
     headers = {"Authorization": f"Bearer {WATI_TOKEN}", "Content-Type": "application/json"}
     params = [
         {"name": "lead_source",    "value": lead_source},
-        {"name": "booking_window", "value": booking_window},
     ]
+    if booking_window:
+        params.append({"name": "booking_window", "value": booking_window})
     if booking_url:
         params.append({"name": "booking_url", "value": booking_url})
     payload = {"customParams": params}
@@ -450,6 +451,12 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         if status == "ok" and service:
             append_booking_pending_lead(service, raw_phone, first_name, lead_source)
         return status
+    # In-hours (or non-W0W template): stamp brand identity on the WATI contact so
+    # downstream flows/conditions always have lead_source. booking_window/booking_url
+    # stay out-of-hours-only. Lowercase to match the WEEKEND FORM chatbot condition.
+    brand_source = LEAD_SOURCE_MAP.get(template)
+    if brand_source:
+        set_lead_attributes(raw_phone, brand_source)
     status = send_w0(raw_phone, first_name, template)
     if status == "ok" and service:
         lead_source = LEAD_SOURCE_MAP.get(template, template.replace("_w0", "")).upper()
