@@ -97,23 +97,38 @@ def is_out_of_hours(now=None) -> bool:
     return True
 
 def booking_window_for(now=None, lead_source: str = "ukdt") -> str:
+    # Routing by ENQUIRY day/time (only reached when is_out_of_hours() is True):
+    #   Mon-Thu >=18:00  -> next day        (nextday event)
+    #   Fri >=14:00, Sat -> coming Monday   (monday event)
+    #   Sun              -> coming Mon+Tue  (suntue / sunday-bst event)
+    # Order matters: Sunday first, then Fri/Sat, then weekday-evening. Friday evening
+    # must fall into the Fri/Sat->Monday bucket, NOT next-day (next day = Sat, closed).
     now = now or datetime.datetime.now(UK_TZ)
-    wd = now.weekday()
+    wd, hr = now.weekday(), now.hour
     brand = (lead_source or "").strip().lower()
+    is_weekday_evening = (wd <= 3 and hr >= 18)          # Mon-Thu after 18:00
+    is_fri_or_sat      = (wd == 4) or (wd == 5)          # Fri (gated >=14:00 upstream) or Sat
     if brand == "bst":
-        if wd == 6:      return "callbacks-sunday-bst"  # Sun -> BST Sunday event
-        return "callbacks-monday-bst"                   # Fri/Sat/evenings -> BST Monday event
-    if wd == 6:          return "callbacks-suntue"       # Sun -> Mon+Tue
-    return "callbacks-monday"                            # Fri/Sat/evenings -> Monday
+        if wd == 6:            return "callbacks-sunday-bst"   # Sun -> Mon+Tue
+        if is_fri_or_sat:      return "callbacks-monday-bst"   # Fri/Sat -> Monday
+        if is_weekday_evening: return "callbacks-nextday-bst"  # Mon-Thu eve -> next day
+        return "callbacks-monday-bst"                          # safety fallback -> Monday
+    if wd == 6:            return "callbacks-suntue"       # Sun -> Mon+Tue
+    if is_fri_or_sat:      return "callbacks-monday"       # Fri/Sat -> Monday
+    if is_weekday_evening: return "callbacks-nextday"      # Mon-Thu eve -> next day
+    return "callbacks-monday"                              # safety fallback -> Monday
 
-def set_lead_attributes(phone: str, lead_source: str, booking_window: str) -> bool:
+def set_lead_attributes(phone: str, lead_source: str, booking_window: str, booking_url: str = "") -> bool:
     formatted = format_phone(phone)
     url = f"{WATI_API_URL}/api/v1/updateContactAttributes/{formatted}"
     headers = {"Authorization": f"Bearer {WATI_TOKEN}", "Content-Type": "application/json"}
-    payload = {"customParams": [
+    params = [
         {"name": "lead_source",    "value": lead_source},
         {"name": "booking_window", "value": booking_window},
-    ]}
+    ]
+    if booking_url:
+        params.append({"name": "booking_url", "value": booking_url})
+    payload = {"customParams": params}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=30)
         if r.status_code in (200, 201):
@@ -429,7 +444,8 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         w0w_template   = W0W_MAP[template]
         lead_source    = LEAD_SOURCE_MAP[template]
         booking_window = booking_window_for(lead_source=lead_source)
-        set_lead_attributes(raw_phone, lead_source, booking_window)
+        booking_url    = f"https://cal.com/debthelpbooking/{booking_window}"
+        set_lead_attributes(raw_phone, lead_source, booking_window, booking_url)
         status = send_w0(raw_phone, first_name, w0w_template)
         if status == "ok" and service:
             append_booking_pending_lead(service, raw_phone, first_name, lead_source)
