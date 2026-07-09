@@ -468,8 +468,13 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     #  (a) whole-tab Declan sources via tab_cfg "wati"=="declan"
     #  (b) BST Form Meta rows with Creative=="Bailiff Companies"
     creative = (str(row[2]).strip().lower() if len(row) > 2 and row[2] else "")
+    form_val = (str(row[1]).strip().lower() if len(row) > 1 and row[1] else "")
+    # Declan's BST leads are identified by FORM = "BAILIFF PHOENIX" (his campaign form),
+    # NOT by creative. Regen's BST leads use form "BAILIFF FORM NEW" (LETTER ARKLE creatives)
+    # and must stay on Regen's tenant. Previously routed on creative=="bailiff companies"
+    # which leaked 9 of Declan's BAILIFF PHOENIX leads to Regen.
     route_declan = (tab_cfg.get("wati") == "declan") or \
-                   (tab == "BST Form Meta" and creative == "bailiff companies")
+                   (tab == "BST Form Meta" and form_val == "bailiff phoenix")
     if route_declan:
         if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
             log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
