@@ -141,6 +141,42 @@ def set_lead_attributes(phone: str, lead_source: str, booking_window: str = "", 
         return False
 
 
+def set_lead_attributes_retry(phone: str, lead_source: str, booking_window: str = "",
+                              booking_url: str = "", attempts: int = 3, delay: float = 2.0) -> bool:
+    """Set attributes with retry. The WATI contact is created by the template send, which
+    may lag slightly, so the first attribute write can land before the contact fully exists.
+    Retry a few times so lead_source reliably persists on new contacts."""
+    import time as _t
+    for i in range(attempts):
+        if set_lead_attributes(phone, lead_source, booking_window, booking_url):
+            # Verify it actually stuck (WATI can 200 on a non-existent contact)
+            if _verify_lead_source(phone, lead_source):
+                return True
+        if i < attempts - 1:
+            _t.sleep(delay)
+    log.error(f"attr-set did NOT persist for {format_phone(phone)} after {attempts} attempts")
+    return False
+
+
+def _verify_lead_source(phone: str, expected: str) -> bool:
+    formatted = format_phone(phone)
+    url = f"{WATI_API_URL}/api/v1/getContacts?pageSize=1&pageNumber=1&name={formatted}"
+    headers = {"Authorization": f"Bearer {WATI_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return False
+        cl = r.json().get("contact_list", [])
+        if not cl:
+            return False
+        for p in cl[0].get("customParams", []):
+            if p.get("name") == "lead_source" and str(p.get("value", "")).strip().lower() == expected.strip().lower():
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def ensure_w0_tracking_sheet(service):
     meta = service.spreadsheets().get(spreadsheetId=W0_TRACKING_SHEET_ID).execute()
     tabs = [s['properties']['title'] for s in meta.get('sheets', [])]
@@ -446,18 +482,22 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         lead_source    = LEAD_SOURCE_MAP[template]
         booking_window = booking_window_for(lead_source=lead_source)
         booking_url    = f"https://cal.com/debthelpbooking/{booking_window}"
-        set_lead_attributes(raw_phone, lead_source, booking_window, booking_url)
+        # Send FIRST so the WATI contact exists, THEN stamp attributes on it.
+        # (Stamping before send hits a non-existent contact and silently no-ops,
+        #  leaving real new leads with no lead_source -> misroute in the chatbot.)
         status = send_w0(raw_phone, first_name, w0w_template)
-        if status == "ok" and service:
-            append_booking_pending_lead(service, raw_phone, first_name, lead_source)
+        if status == "ok":
+            set_lead_attributes_retry(raw_phone, lead_source, booking_window, booking_url)
+            if service:
+                append_booking_pending_lead(service, raw_phone, first_name, lead_source)
         return status
     # In-hours (or non-W0W template): stamp brand identity on the WATI contact so
     # downstream flows/conditions always have lead_source. booking_window/booking_url
     # stay out-of-hours-only. Lowercase to match the WEEKEND FORM chatbot condition.
     brand_source = LEAD_SOURCE_MAP.get(template)
-    if brand_source:
-        set_lead_attributes(raw_phone, brand_source)
     status = send_w0(raw_phone, first_name, template)
+    if status == "ok" and brand_source:
+        set_lead_attributes_retry(raw_phone, brand_source)
     if status == "ok" and service:
         lead_source = LEAD_SOURCE_MAP.get(template, template.replace("_w0", "")).upper()
         append_w0_tracking_row(service, raw_phone, first_name, lead_source, "w0 sent")
