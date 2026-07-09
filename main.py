@@ -142,7 +142,7 @@ def set_lead_attributes(phone: str, lead_source: str, booking_window: str = "", 
 
 
 def set_lead_attributes_retry(phone: str, lead_source: str, booking_window: str = "",
-                              booking_url: str = "", attempts: int = 3, delay: float = 2.0) -> bool:
+                              booking_url: str = "", attempts: int = 5, delay: float = 4.0) -> bool:
     """Set attributes with retry. The WATI contact is created by the template send, which
     may lag slightly, so the first attribute write can land before the contact fully exists.
     Retry a few times so lead_source reliably persists on new contacts."""
