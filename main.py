@@ -482,7 +482,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         declan_template = BST_TEMPLATE_DECLAN if tab == "BST Form Meta" else template
         return send_w0(raw_phone, first_name, declan_template,
                        api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
-    if is_out_of_hours() and template in W0W_MAP:
+    if False and is_out_of_hours() and template in W0W_MAP:
         w0w_template   = W0W_MAP[template]
         lead_source    = LEAD_SOURCE_MAP[template]
         booking_window = booking_window_for(lead_source=lead_source)
