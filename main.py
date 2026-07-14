@@ -108,15 +108,11 @@ def booking_window_for(now=None, lead_source: str = "ukdt") -> str:
     brand = (lead_source or "").strip().lower()
     is_weekday_evening = (wd <= 3 and hr >= 18)          # Mon-Thu after 18:00
     is_fri_or_sat      = (wd == 4) or (wd == 5)          # Fri (gated >=14:00 upstream) or Sat
+    # SIMPLIFIED: one calendar per brand. Availability schedule (Mon-Fri) handles
+    # "next working day" logic, so we no longer pick different slugs by day.
     if brand == "bst":
-        if wd == 6:            return "callbacks-sunday-bst"   # Sun -> Mon+Tue
-        if is_fri_or_sat:      return "callbacks-monday-bst"   # Fri/Sat -> Monday
-        if is_weekday_evening: return "callbacks-nextday-bst"  # Mon-Thu eve -> next day
-        return "callbacks-monday-bst"                          # safety fallback -> Monday
-    if wd == 6:            return "callbacks-suntue"       # Sun -> Mon+Tue
-    if is_fri_or_sat:      return "callbacks-monday"       # Fri/Sat -> Monday
-    if is_weekday_evening: return "callbacks-nextday"      # Mon-Thu eve -> next day
-    return "callbacks-monday"                              # safety fallback -> Monday
+        return "callbacks-monday-bst"
+    return "callbacks-monday"
 
 def set_lead_attributes(phone: str, lead_source: str, booking_window: str = "", booking_url: str = "") -> bool:
     formatted = format_phone(phone)
