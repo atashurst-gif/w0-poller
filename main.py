@@ -594,6 +594,90 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
 # Main loop
 # ─────────────────────────────────────────────
 
+APPS2_SHEET_ID = os.getenv("APPS2_SHEET_ID", "16qnJ842lFAo-4FVhloipJMFdCs7Spc2hFgoWnVGwVUs")
+APPS2_TAB      = os.getenv("APPS2_TAB", "Apps 2.0")
+CALLBACK_SET_STATUS = "Callback Set"
+CALLBACK_SYNC_DRY_RUN = os.getenv("CALLBACK_SYNC_DRY_RUN", "1") == "1"
+
+
+def sync_callback_set(service) -> int:
+    """Find leads who have booked (Apps 2.0 has an Appointment) and mark their
+    Sheet1 row Status = 'Callback Set' so the NC sequence stops messaging them."""
+    # 1. collect booked phone numbers from Apps 2.0
+    try:
+        apps = service.spreadsheets().values().get(
+            spreadsheetId=APPS2_SHEET_ID, range=f"'{APPS2_TAB}'!A:L"
+        ).execute().get("values", [])
+    except Exception as e:
+        log.error(f"callback-sync: cannot read Apps 2.0: {e}")
+        return 0
+    if not apps:
+        return 0
+    hdr = [h.strip().lower() for h in apps[0]]
+    def ci(name):
+        for i, h in enumerate(hdr):
+            if name in h:
+                return i
+        return None
+    a_num, a_appt = ci("number"), ci("appointment")
+    if a_num is None or a_appt is None:
+        log.error("callback-sync: Apps 2.0 missing Number/Appointment column")
+        return 0
+    booked = set()
+    for r in apps[1:]:
+        num = r[a_num].strip() if a_num < len(r) else ""
+        appt = r[a_appt].strip() if a_appt < len(r) else ""
+        if num and appt:
+            ph = format_phone(num)
+            if is_valid_phone(ph):
+                booked.add(ph)
+    if not booked:
+        return 0
+
+    # 2. scan Sheet1 and mark matching rows
+    try:
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=AUTOMATION_SHEET_ID, range="'Sheet1'!A:F"
+        ).execute().get("values", [])
+    except Exception as e:
+        log.error(f"callback-sync: cannot read Sheet1: {e}")
+        return 0
+
+    updates = []
+    for i, r in enumerate(rows[1:], start=2):
+        phone_raw = r[3].strip() if len(r) > 3 else ""
+        status    = r[5].strip() if len(r) > 5 else ""
+        if not phone_raw:
+            continue
+        if is_stopped_sequence_status(status):
+            continue
+        if format_phone(phone_raw) in booked:
+            updates.append((i, r[2].strip() if len(r) > 2 else ""))
+
+    if not updates:
+        return 0
+
+    if CALLBACK_SYNC_DRY_RUN:
+        for rownum, name in updates:
+            log.info(f"callback-sync [DRY RUN] would set row {rownum} ({name}) -> {CALLBACK_SET_STATUS}")
+        return 0
+
+    done = 0
+    for rownum, name in updates:
+        try:
+            service.spreadsheets().values().update(
+                spreadsheetId=AUTOMATION_SHEET_ID,
+                range=f"'Sheet1'!F{rownum}",
+                valueInputOption="RAW",
+                body={"values": [[CALLBACK_SET_STATUS]]},
+            ).execute()
+            log.info(f"callback-sync: row {rownum} ({name}) -> {CALLBACK_SET_STATUS}")
+            done += 1
+        except Exception as e:
+            log.error(f"callback-sync: failed row {rownum}: {e}")
+    return done
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -610,6 +694,7 @@ def main():
                 fired = poll_tab(service, tab_cfg, seen)
                 total_fired += fired
             save_seen(seen)
+            sync_callback_set(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
                 log.info(f"Cycle complete — {total_fired} W0 message(s) sent total")
