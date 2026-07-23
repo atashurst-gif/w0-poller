@@ -678,6 +678,183 @@ def sync_callback_set(service) -> int:
     return done
 
 
+CBNA_DRY_RUN = os.getenv("CBNA_DRY_RUN", "1") == "1"
+
+CBNA_SEQUENCE = [
+    (1, "ukdt_cbna_1",  "bst_cbana_1", "name",       0),
+    (2, "ukdt_cb_na_2", "bst_cbana_2", "name",       5),
+    (3, "ukdt_cbana_3", "bst_cbna_3",  "name",       24 * 60),
+    (4, "ukdt_cbna4",   "bst_cbna4",   None,         48 * 60),
+    (5, "ukdt_cbna5",   "bst_cbna5",   "first_name", 72 * 60),
+]
+
+CBNA_STEP_COLS = {1: 12, 2: 14, 3: 16, 4: 18, 5: 20}
+CBNA_RESP_COLS = {1: 13, 2: 15, 3: 17, 4: 19}
+CBNA_ANSWERED_COL = 9
+CBNA_NAME_COL     = 2
+CBNA_PHONE_COL    = 3
+CBNA_CAMPAIGN_COL = 4
+CBNA_STAMP_FMT = "%d/%m/%Y %H:%M"
+
+
+def _col_letter(idx):
+    letters = ""
+    idx += 1
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _cbna_parse_stamp(cell):
+    cell = (cell or "").strip()
+    if not cell:
+        return 0, None
+    m = re.match(r"\s*(\d+)\s*-\s*(.+)", cell)
+    if not m:
+        return 0, None
+    step = int(m.group(1))
+    try:
+        dt = datetime.datetime.strptime(m.group(2).strip(), CBNA_STAMP_FMT).replace(tzinfo=UK_TZ)
+    except Exception:
+        dt = None
+    return step, dt
+
+
+def _cbna_has_replied(phone, since_dt):
+    if since_dt is None:
+        return False
+    try:
+        url = WATI_API_URL + "/api/v1/getMessages/" + format_phone(phone)
+        r = requests.get(url, headers={"Authorization": "Bearer " + WATI_TOKEN,
+                                       "accept": "application/json"}, timeout=20)
+        items = r.json().get("messages", {}).get("items", [])
+    except Exception as e:
+        log.warning("cbna: reply-check failed for %s: %s" % (phone, e))
+        return False
+    for i in items:
+        if i.get("owner") is False:
+            created = i.get("created") or ""
+            try:
+                dt = datetime.datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S")
+                dt = dt.replace(tzinfo=datetime.timezone.utc).astimezone(UK_TZ)
+            except Exception:
+                continue
+            if dt > since_dt:
+                return True
+    return False
+
+
+def _cbna_send(phone, template, param, first_name):
+    formatted = format_phone(phone)
+    if CBNA_DRY_RUN:
+        log.info("cbna [DRY RUN] would send %s to %s (%s)" % (template, formatted, first_name))
+        return True
+    url = WATI_API_URL + "/api/v2/sendTemplateMessages"
+    headers = {"Authorization": "Bearer " + WATI_TOKEN, "Content-Type": "application/json"}
+    if param:
+        receiver = {"whatsappNumber": formatted,
+                    "customParams": [{"name": param, "value": first_name}]}
+    else:
+        receiver = {"whatsappNumber": formatted}
+    payload = {"template_name": template,
+               "broadcast_name": "cbna_" + template + "_" + formatted[-4:],
+               "receivers": [receiver]}
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code in (200, 201):
+            body = {}
+            try:
+                body = r.json()
+            except Exception:
+                pass
+            if body.get("result") is True:
+                log.info("cbna: sent %s to %s (%s)" % (template, formatted, first_name))
+                return True
+            log.error("cbna: REJECTED %s for %s: %s" % (template, formatted, str(body)[:200]))
+            return False
+        log.error("cbna: WATI %s for %s: %s" % (r.status_code, formatted, r.text[:200]))
+        return False
+    except Exception as e:
+        log.error("cbna: request failed for %s: %s" % (formatted, e))
+        return False
+
+
+def sync_cbna(service):
+    now = datetime.datetime.now(UK_TZ)
+    rng = "'" + APPS2_TAB + "'!A:U"
+    try:
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=APPS2_SHEET_ID, range=rng).execute().get("values", [])
+    except Exception as e:
+        log.error("cbna: cannot read Apps 2.0: %s" % e)
+        return 0
+    if not rows:
+        return 0
+    sent_total = 0
+    for i, r in enumerate(rows[1:], start=2):
+        def g(idx):
+            return r[idx].strip() if idx < len(r) else ""
+        if g(CBNA_ANSWERED_COL).lower() != "no":
+            continue
+        phone = g(CBNA_PHONE_COL)
+        if not phone or not is_valid_phone(format_phone(phone)):
+            continue
+        if any(g(c) for c in CBNA_RESP_COLS.values()):
+            continue
+        cur_step, last_dt = 0, None
+        for step in (5, 4, 3, 2, 1):
+            st, dt = _cbna_parse_stamp(g(CBNA_STEP_COLS[step]))
+            if st:
+                cur_step, last_dt = st, dt
+                break
+        if cur_step >= 5:
+            continue
+        if cur_step and _cbna_has_replied(phone, last_dt):
+            resp_col = CBNA_RESP_COLS.get(cur_step)
+            if resp_col is not None:
+                stamp = now.strftime(CBNA_STAMP_FMT)
+                if CBNA_DRY_RUN:
+                    log.info("cbna [DRY RUN] row %s: reply detected, would stamp Response%s" % (i, cur_step))
+                else:
+                    service.spreadsheets().values().update(
+                        spreadsheetId=APPS2_SHEET_ID,
+                        range="'" + APPS2_TAB + "'!" + _col_letter(resp_col) + str(i),
+                        valueInputOption="RAW",
+                        body={"values": [[stamp]]}).execute()
+                    log.info("cbna: row %s reply -> Response%s %s" % (i, cur_step, stamp))
+            continue
+        nxt = cur_step + 1
+        step_no, ukdt_t, bst_t, param, delay_min = CBNA_SEQUENCE[nxt - 1]
+        if nxt == 1:
+            due = True
+        else:
+            if last_dt is None:
+                continue
+            due = now >= (last_dt + datetime.timedelta(minutes=delay_min))
+        if not due:
+            continue
+        campaign = g(CBNA_CAMPAIGN_COL).upper()
+        template = bst_t if "BST" in campaign else ukdt_t
+        full = g(CBNA_NAME_COL)
+        first_name = full.split()[0].title() if full else "there"
+        if _cbna_send(phone, template, param, first_name):
+            sent_total += 1
+            cell = str(step_no) + " - " + now.strftime(CBNA_STAMP_FMT)
+            if CBNA_DRY_RUN:
+                log.info("cbna [DRY RUN] row %s: would write '%s' to CBNA%s" % (i, cell, step_no))
+            else:
+                service.spreadsheets().values().update(
+                    spreadsheetId=APPS2_SHEET_ID,
+                    range="'" + APPS2_TAB + "'!" + _col_letter(CBNA_STEP_COLS[step_no]) + str(i),
+                    valueInputOption="RAW",
+                    body={"values": [[cell]]}).execute()
+            time.sleep(1)
+    if sent_total:
+        log.info("cbna: cycle complete - %s message(s) sent%s" % (sent_total, " [DRY RUN]" if CBNA_DRY_RUN else ""))
+    return sent_total
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -695,6 +872,7 @@ def main():
                 total_fired += fired
             save_seen(seen)
             sync_callback_set(service)
+            sync_cbna(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
                 log.info(f"Cycle complete — {total_fired} W0 message(s) sent total")
