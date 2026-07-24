@@ -797,6 +797,22 @@ def sync_cbna(service):
             return r[idx].strip() if idx < len(r) else ""
         if g(CBNA_ANSWERED_COL).lower() != "no":
             continue
+        _cut = os.getenv("CBNA_CUTOFF_DATE", "")
+        if _cut:
+            try:
+                _cd = datetime.datetime.strptime(_cut, "%d/%m/%Y").replace(tzinfo=UK_TZ)
+            except Exception:
+                _cd = None
+            if _cd:
+                _rd = None
+                for _f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                    try:
+                        _rd = datetime.datetime.strptime(g(0), _f).replace(tzinfo=UK_TZ)
+                        break
+                    except Exception:
+                        pass
+                if _rd is None or _rd < _cd:
+                    continue
         phone = g(CBNA_PHONE_COL)
         if not phone or not is_valid_phone(format_phone(phone)):
             continue
