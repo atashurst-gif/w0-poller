@@ -409,13 +409,21 @@ def send_w0(phone: str, first_name: str, template: str, api_url: str = None, tok
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    TEMPLATE_PARAM = {
+        "council_tax_dhd_w0": "name",
+        "utility_w0": "name",
+        "bailiff_dhd_w0": "name",
+        "debt_collector_dhd_w0": "name",
+        "consolidation_dhd_w0": "name",
+    }
+    param_name = TEMPLATE_PARAM.get(template, "first_name")
     payload = {
         "template_name":  template,
         "broadcast_name": f"w0_{template}_{formatted[-4:]}",
         "receivers": [
             {
                 "whatsappNumber": formatted,
-                "customParams": [{"name": "first_name", "value": first_name}],
+                "customParams": [{"name": param_name, "value": first_name}],
             }
         ],
     }
