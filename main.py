@@ -114,10 +114,13 @@ def booking_window_for(now=None, lead_source: str = "ukdt") -> str:
         return "callbacks-monday-bst"
     return "callbacks-monday"
 
-def set_lead_attributes(phone: str, lead_source: str, booking_window: str = "", booking_url: str = "") -> bool:
+def set_lead_attributes(phone: str, lead_source: str, booking_window: str = "", booking_url: str = "",
+                        api_url: str = None, token: str = None) -> bool:
     formatted = format_phone(phone)
-    url = f"{WATI_API_URL}/api/v1/updateContactAttributes/{formatted}"
-    headers = {"Authorization": f"Bearer {WATI_TOKEN}", "Content-Type": "application/json"}
+    _url = api_url or WATI_API_URL
+    _tok = token or WATI_TOKEN
+    url = f"{_url}/api/v1/updateContactAttributes/{formatted}"
+    headers = {"Authorization": f"Bearer {_tok}", "Content-Type": "application/json"}
     params = [
         {"name": "lead_source",    "value": lead_source},
     ]
@@ -487,8 +490,19 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
             return "skip"
         declan_template = BST_TEMPLATE_DECLAN if tab == "BST Form Meta" else template
-        return send_w0(raw_phone, first_name, declan_template,
-                       api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        status = send_w0(raw_phone, first_name, declan_template,
+                         api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        DHD_SOURCE = {
+            "council_tax_dhd_w0": "dhd_ct",
+            "utility_w0": "dhd_utility",
+            "bailiff_dhd_w0": "dhd_bailiff",
+            "debt_collector_dhd_w0": "dhd_dc",
+            "consolidation_dhd_w0": "dhd_consolidation",
+        }
+        dhd_src = DHD_SOURCE.get(template)
+        if status == "ok" and dhd_src:
+            set_lead_attributes(raw_phone, dhd_src, api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        return status
     if False and is_out_of_hours() and template in W0W_MAP:
         w0w_template   = W0W_MAP[template]
         lead_source    = LEAD_SOURCE_MAP[template]
