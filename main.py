@@ -283,6 +283,17 @@ WATCH_TABS = [
         "full_name":   True,
         "wati":        "declan",
     },
+    # ---- DHD (Declan) 5-campaign W0s: Created(0) FullName(1) Email(2) Number(3) ----
+    {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CT1",
+     "template": "council_tax_dhd_w0",    "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+    {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD UTI1",
+     "template": "utility_w0",            "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+    {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD BAI1",
+     "template": "bailiff_dhd_w0",        "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+    {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DC FORM1",
+     "template": "debt_collector_dhd_w0", "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+    {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CON1",
+     "template": "consolidation_dhd_w0",  "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
 ]
 
 # ─────────────────────────────────────────────
