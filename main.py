@@ -87,7 +87,7 @@ STOPPED_SEQUENCE_STATUSES = {
 # ── Out-of-hours booking gate ──────────────────
 UK_TZ = ZoneInfo("Europe/London")
 W0W_MAP         = {"ukdt_w0": "ukdt_w0w", "bst_nc0": "bst_w0w"}
-LEAD_SOURCE_MAP = {"ukdt_w0": "ukdt",     "bst_nc0": "bst"}
+LEAD_SOURCE_MAP = {"ukdt_w0": "ukdt",     "bst_nc0": "bst",     "ukdt_gds_w0": "gds"}
 
 def is_out_of_hours(now=None) -> bool:
     now = now or datetime.datetime.now(UK_TZ)
@@ -269,7 +269,7 @@ WATCH_TABS = [
     {
         "sheet_id":    UKDT_SHEET_ID,
         "tab":         "UKDT WEBSITE",
-        "template":    UKDT_TEMPLATE,
+        "template":    "ukdt_gds_w0",
         "phone_col":   4,
         "name_col":    2,
         "skip_rows":   1,
@@ -415,6 +415,7 @@ def send_w0(phone: str, first_name: str, template: str, api_url: str = None, tok
         "bailiff_dhd_w0": "name",
         "debt_collector_dhd_w0": "name",
         "consolidation_dhd_w0": "name",
+        "ukdt_gds_w0": "first_name",
     }
     param_name = TEMPLATE_PARAM.get(template, "first_name")
     payload = {
