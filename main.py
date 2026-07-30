@@ -270,9 +270,21 @@ WATCH_TABS = [
         "sheet_id":    UKDT_SHEET_ID,
         "tab":         "UKDT WEBSITE",
         "template":    "ukdt_gds_w0",
+        "lead_source": "ukdt_o",
         "phone_col":   4,
         "name_col":    2,
         "skip_rows":   1,
+    },
+    # UKDT GDC1: Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
+    {
+        "sheet_id":    UKDT_SHEET_ID,
+        "tab":         "UKDT GDC1",
+        "template":    "ukdt_gds_w0",
+        "lead_source": "gds",
+        "phone_col":   5,
+        "name_col":    3,
+        "skip_rows":   1,
+        "full_name":   True,
     },
     # UKDTCTD1 (Dec) — Declan's UKDT source: Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
     # Whole tab routes to DECLAN's WATI with ukdt_ct_w0 (NOT Regen's).
@@ -529,7 +541,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     # In-hours (or non-W0W template): stamp brand identity on the WATI contact so
     # downstream flows/conditions always have lead_source. booking_window/booking_url
     # stay out-of-hours-only. Lowercase to match the WEEKEND FORM chatbot condition.
-    brand_source = LEAD_SOURCE_MAP.get(template)
+    brand_source = tab_cfg.get("lead_source") or LEAD_SOURCE_MAP.get(template)
     status = send_w0(raw_phone, first_name, template)
     if status == "ok" and brand_source:
         set_lead_attributes_retry(raw_phone, brand_source)
