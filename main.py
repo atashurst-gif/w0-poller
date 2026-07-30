@@ -77,7 +77,7 @@ AUTOMATION_TAB = os.getenv("AUTOMATION_TAB", "Sheet1")
 W0_TRACKING_SHEET_ID = os.getenv("W0_TRACKING_SHEET_ID", AUTOMATION_SHEET_ID)
 W0_TRACKING_TAB = os.getenv("W0_TRACKING_TAB", "W0 Tracking")
 BOOKING_PENDING_STATUS = "booking pending"
-SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST"}
+SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST", "ukdt_josh": "UKDT CT"}
 STOPPED_SEQUENCE_STATUSES = {
     "replied", "completed", "opted out", "converted", "do not contact",
     "dnc", "dnq", "callback", "interested", "agreed", "lead passed",
@@ -281,6 +281,17 @@ WATCH_TABS = [
         "tab":         "UKDT GDC1",
         "template":    "ukdt_gds_w0",
         "lead_source": "gds",
+        "phone_col":   5,
+        "name_col":    3,
+        "skip_rows":   1,
+        "full_name":   True,
+    },
+    # UKDT JOSH VIDS (Josh's own CT source): Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
+    {
+        "sheet_id":    UKDT_SHEET_ID,
+        "tab":         "UKDT JOSH VIDS",
+        "template":    UKDT_TEMPLATE,
+        "lead_source": "ukdt_josh",
         "phone_col":   5,
         "name_col":    3,
         "skip_rows":   1,
