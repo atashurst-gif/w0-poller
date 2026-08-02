@@ -928,6 +928,100 @@ def sync_cbna(service):
     return sent_total
 
 
+JOSH_SHEET_ID = os.getenv("JOSH_SHEET_ID", "1yn8_xUIbeKeUG6BSEbWq1C7ELvzx1ye536_uf63rmCQ")
+JOSH_TAB      = os.getenv("JOSH_TAB", "Callbacks set")
+JOSH_LEAD_TAB = os.getenv("JOSH_LEAD_TAB", "UKDT JOSH VIDS")
+JOSH_SYNC_DRY_RUN = os.getenv("JOSH_SYNC_DRY_RUN", "1") == "1"
+
+
+def _josh_date(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    for f in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.datetime.strptime(s[:10], f).date()
+        except Exception:
+            pass
+    return None
+
+
+def sync_josh_bookings(service) -> int:
+    """Copy bookings belonging to Josh's leads into his own tracker.
+    A booking counts as his only if the booking date is on/after the date
+    that lead entered his lead tab (stops old pre-campaign bookings coming across)."""
+    try:
+        lv = service.spreadsheets().values().get(
+            spreadsheetId=UKDT_SHEET_ID,
+            range="'" + JOSH_LEAD_TAB + "'!A:F").execute().get("values", [])
+    except Exception as e:
+        log.error("josh-sync: cannot read lead tab: %s" % e)
+        return 0
+    leads = {}
+    for r in lv[1:]:
+        if len(r) > 5 and r[5].strip():
+            ph = format_phone(r[5])
+            d = _josh_date(r[0] if len(r) > 0 else "")
+            if not ph or d is None:
+                continue
+            if ph not in leads or d < leads[ph]:
+                leads[ph] = d
+    if not leads:
+        return 0
+
+    try:
+        apps = service.spreadsheets().values().get(
+            spreadsheetId=APPS2_SHEET_ID,
+            range="'" + APPS2_TAB + "'!A:U").execute().get("values", [])
+        cur = service.spreadsheets().values().get(
+            spreadsheetId=JOSH_SHEET_ID,
+            range="'" + JOSH_TAB + "'!A:D").execute().get("values", [])
+    except Exception as e:
+        log.error("josh-sync: cannot read sheets: %s" % e)
+        return 0
+
+    already = set()
+    for r in cur[1:]:
+        if len(r) > 3 and r[3].strip():
+            already.add(format_phone(r[3]))
+
+    rows = []
+    for r in apps[1:]:
+        def g(n):
+            return r[n].strip() if n < len(r) else ""
+        ph_raw = g(3)
+        if not ph_raw or not g(7):
+            continue
+        ph = format_phone(ph_raw)
+        if ph not in leads or ph in already:
+            continue
+        bd = _josh_date(g(0))
+        if bd is None or bd < leads[ph]:
+            continue
+        rows.append([g(0), g(1), g(2), g(3), g(4), g(6), g(7), g(8), g(9), g(11)])
+        already.add(ph)
+
+    if not rows:
+        return 0
+    if JOSH_SYNC_DRY_RUN:
+        for x in rows:
+            log.info("josh-sync [DRY RUN] would add %s (%s) appt %s %s" % (x[2], x[3], x[6], x[7]))
+        return 0
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=JOSH_SHEET_ID,
+            range="'" + JOSH_TAB + "'!A:J",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows}).execute()
+        for x in rows:
+            log.info("josh-sync: added %s (%s) appt %s %s" % (x[2], x[3], x[6], x[7]))
+    except Exception as e:
+        log.error("josh-sync: write failed: %s" % e)
+        return 0
+    return len(rows)
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -946,6 +1040,7 @@ def main():
             save_seen(seen)
             sync_callback_set(service)
             sync_cbna(service)
+            sync_josh_bookings(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
                 log.info(f"Cycle complete — {total_fired} W0 message(s) sent total")
