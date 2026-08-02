@@ -837,66 +837,102 @@ def _cbna_send(phone, template, param, first_name):
         return False
 
 
-def sync_cbna(service):
+CBNA_SHEETS = [
+    {
+        "name": "apps2",
+        "sheet_id": APPS2_SHEET_ID,
+        "tab": APPS2_TAB,
+        "rng": "A:U",
+        "answered": 9, "name_col": 2, "phone_col": 3, "campaign_col": 4,
+        "steps": {1: 12, 2: 14, 3: 16, 4: 18, 5: 20},
+        "resps": {1: 13, 2: 15, 3: 17, 4: 19},
+        "use_cutoff": True,
+    },
+    {
+        "name": "josh",
+        "sheet_id": os.getenv("JOSH_SHEET_ID", "1yn8_xUIbeKeUG6BSEbWq1C7ELvzx1ye536_uf63rmCQ"),
+        "tab": os.getenv("JOSH_TAB", "Callbacks set"),
+        "rng": "A:T",
+        "answered": 8, "name_col": 2, "phone_col": 3, "campaign_col": 4,
+        "steps": {1: 10, 2: 12, 3: 14, 4: 16, 5: 18},
+        "resps": {1: 11, 2: 13, 3: 15, 4: 17, 5: 19},
+        "use_cutoff": False,
+    },
+]
+
+
+def _cbna_for_sheet(service, cfg) -> int:
     now = datetime.datetime.now(UK_TZ)
-    rng = "'" + APPS2_TAB + "'!A:U"
+    tag = "cbna[" + cfg["name"] + "]"
     try:
         rows = service.spreadsheets().values().get(
-            spreadsheetId=APPS2_SHEET_ID, range=rng).execute().get("values", [])
+            spreadsheetId=cfg["sheet_id"],
+            range="'" + cfg["tab"] + "'!" + cfg["rng"]).execute().get("values", [])
     except Exception as e:
-        log.error("cbna: cannot read Apps 2.0: %s" % e)
+        log.error("%s: cannot read sheet: %s" % (tag, e))
         return 0
     if not rows:
         return 0
+
+    step_cols = cfg["steps"]
+    resp_cols = cfg["resps"]
     sent_total = 0
+
     for i, r in enumerate(rows[1:], start=2):
         def g(idx):
             return r[idx].strip() if idx < len(r) else ""
-        if g(CBNA_ANSWERED_COL).lower() != "no":
+
+        if g(cfg["answered"]).lower() != "no":
             continue
-        _cut = os.getenv("CBNA_CUTOFF_DATE", "")
-        if _cut:
-            try:
-                _cd = datetime.datetime.strptime(_cut, "%d/%m/%Y").replace(tzinfo=UK_TZ)
-            except Exception:
-                _cd = None
-            if _cd:
-                _rd = None
-                for _f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
-                    try:
-                        _rd = datetime.datetime.strptime(g(0), _f).replace(tzinfo=UK_TZ)
-                        break
-                    except Exception:
-                        pass
-                if _rd is None or _rd < _cd:
-                    continue
-        phone = g(CBNA_PHONE_COL)
+
+        if cfg["use_cutoff"]:
+            _cut = os.getenv("CBNA_CUTOFF_DATE", "")
+            if _cut:
+                try:
+                    _cd = datetime.datetime.strptime(_cut, "%d/%m/%Y").replace(tzinfo=UK_TZ)
+                except Exception:
+                    _cd = None
+                if _cd:
+                    _rd = None
+                    for _f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                        try:
+                            _rd = datetime.datetime.strptime(g(0)[:10], _f).replace(tzinfo=UK_TZ)
+                            break
+                        except Exception:
+                            pass
+                    if _rd is None or _rd < _cd:
+                        continue
+
+        phone = g(cfg["phone_col"])
         if not phone or not is_valid_phone(format_phone(phone)):
             continue
-        if any(g(c) for c in CBNA_RESP_COLS.values()):
+        if any(g(c) for c in resp_cols.values()):
             continue
+
         cur_step, last_dt = 0, None
         for step in (5, 4, 3, 2, 1):
-            st, dt = _cbna_parse_stamp(g(CBNA_STEP_COLS[step]))
+            st, dt = _cbna_parse_stamp(g(step_cols[step]))
             if st:
                 cur_step, last_dt = st, dt
                 break
         if cur_step >= 5:
             continue
+
         if cur_step and _cbna_has_replied(phone, last_dt):
-            resp_col = CBNA_RESP_COLS.get(cur_step)
+            resp_col = resp_cols.get(cur_step)
             if resp_col is not None:
                 stamp = now.strftime(CBNA_STAMP_FMT)
                 if CBNA_DRY_RUN:
-                    log.info("cbna [DRY RUN] row %s: reply detected, would stamp Response%s" % (i, cur_step))
+                    log.info("%s [DRY RUN] row %s: reply detected, would stamp Response%s" % (tag, i, cur_step))
                 else:
                     service.spreadsheets().values().update(
-                        spreadsheetId=APPS2_SHEET_ID,
-                        range="'" + APPS2_TAB + "'!" + _col_letter(resp_col) + str(i),
+                        spreadsheetId=cfg["sheet_id"],
+                        range="'" + cfg["tab"] + "'!" + _col_letter(resp_col) + str(i),
                         valueInputOption="RAW",
                         body={"values": [[stamp]]}).execute()
-                    log.info("cbna: row %s reply -> Response%s %s" % (i, cur_step, stamp))
+                    log.info("%s: row %s reply -> Response%s %s" % (tag, i, cur_step, stamp))
             continue
+
         nxt = cur_step + 1
         step_no, ukdt_t, bst_t, param, delay_min = CBNA_SEQUENCE[nxt - 1]
         if nxt == 1:
@@ -907,25 +943,38 @@ def sync_cbna(service):
             due = now >= (last_dt + datetime.timedelta(minutes=delay_min))
         if not due:
             continue
-        campaign = g(CBNA_CAMPAIGN_COL).upper()
+
+        campaign = g(cfg["campaign_col"]).upper()
         template = bst_t if "BST" in campaign else ukdt_t
-        full = g(CBNA_NAME_COL)
+        full = g(cfg["name_col"])
         first_name = full.split()[0].title() if full else "there"
+
         if _cbna_send(phone, template, param, first_name):
             sent_total += 1
             cell = str(step_no) + " - " + now.strftime(CBNA_STAMP_FMT)
             if CBNA_DRY_RUN:
-                log.info("cbna [DRY RUN] row %s: would write '%s' to CBNA%s" % (i, cell, step_no))
+                log.info("%s [DRY RUN] row %s: would write '%s' to CBNA%s" % (tag, i, cell, step_no))
             else:
                 service.spreadsheets().values().update(
-                    spreadsheetId=APPS2_SHEET_ID,
-                    range="'" + APPS2_TAB + "'!" + _col_letter(CBNA_STEP_COLS[step_no]) + str(i),
+                    spreadsheetId=cfg["sheet_id"],
+                    range="'" + cfg["tab"] + "'!" + _col_letter(step_cols[step_no]) + str(i),
                     valueInputOption="RAW",
                     body={"values": [[cell]]}).execute()
             time.sleep(1)
+
     if sent_total:
-        log.info("cbna: cycle complete - %s message(s) sent%s" % (sent_total, " [DRY RUN]" if CBNA_DRY_RUN else ""))
+        log.info("%s: %s message(s) sent%s" % (tag, sent_total, " [DRY RUN]" if CBNA_DRY_RUN else ""))
     return sent_total
+
+
+def sync_cbna(service) -> int:
+    total = 0
+    for cfg in CBNA_SHEETS:
+        try:
+            total += _cbna_for_sheet(service, cfg)
+        except Exception as e:
+            log.error("cbna[%s]: cycle error: %s" % (cfg["name"], e))
+    return total
 
 
 JOSH_SHEET_ID = os.getenv("JOSH_SHEET_ID", "1yn8_xUIbeKeUG6BSEbWq1C7ELvzx1ye536_uf63rmCQ")
