@@ -1071,6 +1071,92 @@ def sync_josh_bookings(service) -> int:
     return len(rows)
 
 
+JOSH_PURGE_DRY_RUN = os.getenv("JOSH_PURGE_DRY_RUN", "1") == "1"
+
+
+def purge_josh_from_apps2(service) -> int:
+    """Remove Josh's bookings from Apps 2.0 once they are safely in his own tracker.
+    Three gates: booking on/after that lead's Josh date, present in Josh's tracker,
+    and untouched by Ian (no handler, no status)."""
+    try:
+        meta = service.spreadsheets().get(spreadsheetId=APPS2_SHEET_ID).execute()
+    except Exception as e:
+        log.error("josh-purge: cannot read Apps 2.0 metadata: %s" % e)
+        return 0
+    gid = None
+    for sh in meta.get("sheets", []):
+        if sh["properties"]["title"] == APPS2_TAB:
+            gid = sh["properties"]["sheetId"]
+    if gid is None:
+        log.error("josh-purge: Apps 2.0 tab not found")
+        return 0
+
+    try:
+        jv = service.spreadsheets().values().get(
+            spreadsheetId=UKDT_SHEET_ID,
+            range="'" + JOSH_LEAD_TAB + "'!A:F").execute().get("values", [])
+        jt = service.spreadsheets().values().get(
+            spreadsheetId=JOSH_SHEET_ID,
+            range="'" + JOSH_TAB + "'!A:D").execute().get("values", [])
+        apps = service.spreadsheets().values().get(
+            spreadsheetId=APPS2_SHEET_ID,
+            range="'" + APPS2_TAB + "'!A:U").execute().get("values", [])
+    except Exception as e:
+        log.error("josh-purge: cannot read sheets: %s" % e)
+        return 0
+
+    leads = {}
+    for r in jv[1:]:
+        if len(r) > 5 and r[5].strip():
+            ph = format_phone(r[5])
+            d = _josh_date(r[0] if len(r) > 0 else "")
+            if ph and d and (ph not in leads or d < leads[ph]):
+                leads[ph] = d
+    if not leads:
+        return 0
+
+    intracker = set()
+    for r in jt[1:]:
+        if len(r) > 3 and r[3].strip():
+            intracker.add(format_phone(r[3]))
+
+    todel = []
+    for i, r in enumerate(apps[1:], start=2):
+        def g(x):
+            return r[x].strip() if x < len(r) else ""
+        if not g(3):
+            continue
+        ph = format_phone(g(3))
+        if ph not in leads or ph not in intracker:
+            continue
+        bd = _josh_date(g(0))
+        if bd is None or bd < leads[ph]:
+            continue
+        if g(5) or g(10):
+            continue
+        todel.append((i, g(2), g(3)))
+
+    if not todel:
+        return 0
+    if JOSH_PURGE_DRY_RUN:
+        for x in todel:
+            log.info("josh-purge [DRY RUN] would remove Apps2 row %s (%s %s)" % (x[0], x[1], x[2]))
+        return 0
+
+    reqs = [{"deleteDimension": {"range": {"sheetId": gid, "dimension": "ROWS",
+             "startIndex": x[0] - 1, "endIndex": x[0]}}}
+            for x in sorted(todel, key=lambda y: -y[0])]
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=APPS2_SHEET_ID, body={"requests": reqs}).execute()
+        for x in todel:
+            log.info("josh-purge: removed Apps2 row %s (%s %s)" % (x[0], x[1], x[2]))
+    except Exception as e:
+        log.error("josh-purge: delete failed: %s" % e)
+        return 0
+    return len(todel)
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -1090,6 +1176,7 @@ def main():
             sync_callback_set(service)
             sync_cbna(service)
             sync_josh_bookings(service)
+            purge_josh_from_apps2(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
                 log.info(f"Cycle complete — {total_fired} W0 message(s) sent total")
