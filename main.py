@@ -691,6 +691,32 @@ def sync_callback_set(service) -> int:
             ph = format_phone(num)
             if is_valid_phone(ph):
                 booked.add(ph)
+
+    # Josh's bookings no longer land in Apps 2.0, so read his tracker too.
+    try:
+        jrows = service.spreadsheets().values().get(
+            spreadsheetId=JOSH_SHEET_ID, range="'" + JOSH_TAB + "'" + "!A:J"
+        ).execute().get("values", [])
+        if jrows:
+            jhdr = [h.strip().lower() for h in jrows[0]]
+            def jci(name):
+                for i, h in enumerate(jhdr):
+                    if name in h:
+                        return i
+                return None
+            j_num, j_appt = jci("number"), jci("appointment")
+            if j_num is not None and j_appt is not None:
+                for r in jrows[1:]:
+                    num = r[j_num].strip() if j_num < len(r) else ""
+                    appt = r[j_appt].strip() if j_appt < len(r) else ""
+                    if num and appt:
+                        ph = format_phone(num)
+                        if is_valid_phone(ph):
+                            booked.add(ph)
+            else:
+                log.warning("callback-sync: Josh tracker missing Number/Appointment column")
+    except Exception as e:
+        log.error("callback-sync: cannot read Josh tracker: %s" % e)
     if not booked:
         return 0
 
