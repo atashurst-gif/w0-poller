@@ -388,6 +388,9 @@ def format_phone(raw: str) -> str:
         return "44" + digits[1:]
     if digits.startswith("447") and len(digits) == 12:
         return digits
+    # 44 + leading 0 double-prefix from Cal.com bookings e.g. 4407412112229
+    if digits.startswith("440") and len(digits) == 13:
+        return "44" + digits[3:]
     if digits.startswith("44") and len(digits) >= 11:
         return digits
     if digits.startswith("7") and len(digits) == 10:
