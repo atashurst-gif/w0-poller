@@ -1343,6 +1343,7 @@ def main():
             sync_callback_set(service)
             sync_cbna(service)
             sync_josh_bookings(service)
+            retry_failed_dhd_w0(service)
             purge_josh_from_apps2(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
