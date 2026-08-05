@@ -1324,6 +1324,90 @@ def retry_failed_dhd_w0(service) -> int:
     return sent_count
 
 
+REMINDER_DRY_RUN = os.getenv("REMINDER_DRY_RUN", "1") == "1"
+REMINDER_TEMPLATE = os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins")
+
+
+def _appt_dt(dstr, tstr):
+    """Parse 'DD-MM-YYYY' + 'HH:MM' into a UK-aware datetime. None if unusable."""
+    d = str(dstr or "").strip().replace("/", "-")
+    t = str(tstr or "").strip()
+    if not d or not t or t.upper() == "NOW":
+        return None
+    if ":" not in t:
+        return None
+    for fmt in ("%d-%m-%Y", "%d-%m-%y"):
+        try:
+            base = datetime.datetime.strptime(d, fmt)
+            break
+        except Exception:
+            base = None
+    if base is None:
+        return None
+    try:
+        hh, mm = t.split(":")[0:2]
+        return base.replace(hour=int(hh), minute=int(mm), tzinfo=UK_TZ)
+    except Exception:
+        return None
+
+
+def send_callback_reminders(service) -> int:
+    """30 minutes before a booked callback, remind the client. Apps 2.0 only.
+    Skips rows with an Answered value (already chased) and rows already stamped."""
+    now = datetime.datetime.now(UK_TZ)
+    try:
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=APPS2_SHEET_ID,
+            range="'" + APPS2_TAB + "'" + "!A:W").execute().get("values", [])
+    except Exception as e:
+        log.error("reminder: cannot read Apps 2.0: %s" % e)
+        return 0
+
+    sent = 0
+    stamps = []
+    for i, r in enumerate(rows[1:], start=2):
+        def g(n):
+            return r[n].strip() if n < len(r) else ""
+        if g(22):
+            continue
+        if g(9):
+            continue
+        phone, appt, tm = g(3), g(7), g(8)
+        if not phone or not appt or not tm:
+            continue
+        due = _appt_dt(appt, tm)
+        if due is None:
+            continue
+        mins = (due - now).total_seconds() / 60.0
+        if mins < 25 or mins > 35:
+            continue
+        ph = format_phone(phone)
+        if not is_valid_phone(ph):
+            continue
+        first = (g(2).split()[0].title() if g(2).strip() else "there")
+        if REMINDER_DRY_RUN:
+            log.info("reminder [DRY RUN] would send to %s (%s) for %s %s"
+                     % (ph, first, appt, tm))
+            continue
+        st = send_w0(ph, first, REMINDER_TEMPLATE)
+        if st == "ok":
+            stamps.append({"range": "'" + APPS2_TAB + "'" + "!W" + str(i),
+                           "values": [[now.strftime("%d/%m/%Y %H:%M")]]})
+            log.info("reminder: sent to %s (%s) for %s %s" % (ph, first, appt, tm))
+            sent += 1
+        else:
+            log.warning("reminder: send to %s returned %s" % (ph, st))
+
+    if stamps:
+        try:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=APPS2_SHEET_ID,
+                body={"valueInputOption": "RAW", "data": stamps}).execute()
+        except Exception as e:
+            log.error("reminder: stamp failed: %s" % e)
+    return sent
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -1344,6 +1428,7 @@ def main():
             sync_cbna(service)
             sync_josh_bookings(service)
             retry_failed_dhd_w0(service)
+            send_callback_reminders(service)
             purge_josh_from_apps2(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
