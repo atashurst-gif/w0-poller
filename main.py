@@ -1189,6 +1189,141 @@ def purge_josh_from_apps2(service) -> int:
     return len(todel)
 
 
+DHD_RETRY_DRY_RUN = os.getenv("DHD_RETRY_DRY_RUN", "1") == "1"
+DHD_RETRY_WINDOW_HOURS = int(os.getenv("DHD_RETRY_WINDOW_HOURS", "6"))
+
+_DHD_TEMPLATE_FOR_SOURCE = {
+    "dhd_ct": "council_tax_dhd_w0",
+    "dhd_utility": "utility_w0",
+    "dhd_bailiff": "bailiff_dhd_w0",
+    "dhd_dc": "debt_collector_dhd_w0",
+    "dhd_consolidation": "consolidation_dhd_w0",
+}
+
+
+def _name_key(v):
+    return "".join(ch for ch in str(v or "").lower() if ch.isalpha())
+
+
+def _wati_status(number):
+    """Latest message status for a number on Declan's tenant, or None."""
+    try:
+        r = requests.get(WATI_API_URL_DECLAN + "/api/v1/getMessages/" + number,
+                         headers={"Authorization": "Bearer " + WATI_TOKEN_DECLAN},
+                         params={"pageSize": 5, "pageNumber": 1}, timeout=30)
+        items = (r.json().get("messages") or {}).get("items") or []
+        for m in items:
+            st = m.get("statusString")
+            if st:
+                return st
+    except Exception as e:
+        log.warning("dhd-retry: status check failed for %s: %s" % (number, e))
+    return None
+
+
+def retry_failed_dhd_w0(service) -> int:
+    """A DHD lead types their phone into the enquiry form, but arrives via CTWA on a
+    different WhatsApp number. The W0 goes to the typed number and FAILS. This finds
+    those and retries against the CTWA contact, but only on an unambiguous name match."""
+    if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
+        return 0
+    now = datetime.datetime.now(UK_TZ)
+    try:
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=W0_TRACKING_SHEET_ID,
+            range="'" + W0_TRACKING_TAB + "'" + "!A:F").execute().get("values", [])
+    except Exception as e:
+        log.error("dhd-retry: cannot read W0 Tracking: %s" % e)
+        return 0
+
+    done = set()
+    cands = []
+    for r in rows[1:]:
+        def g(i):
+            return r[i].strip() if i < len(r) else ""
+        camp, status, phone = g(4), g(5).lower(), g(3)
+        if not phone:
+            continue
+        if status == "w0 resent":
+            done.add(phone)
+            continue
+        if not camp.lower().startswith("dhd_"):
+            continue
+        try:
+            sent = datetime.datetime.strptime(g(0), "%d/%m/%Y %H:%M").replace(tzinfo=UK_TZ)
+        except Exception:
+            continue
+        age = (now - sent).total_seconds() / 3600.0
+        if age < 0 or age > DHD_RETRY_WINDOW_HOURS:
+            continue
+        cands.append((phone, g(2), camp.lower(), sent))
+
+    cands = [c for c in cands if c[0] not in done]
+    if not cands:
+        return 0
+
+    failed = [c for c in cands if _wati_status(c[0]) == "FAILED"]
+    if not failed:
+        return 0
+
+    try:
+        contacts = []
+        for page in range(1, 6):
+            r = requests.get(WATI_API_URL_DECLAN + "/api/v1/getContacts",
+                             headers={"Authorization": "Bearer " + WATI_TOKEN_DECLAN},
+                             params={"pageSize": 100, "pageNumber": page}, timeout=30)
+            cl = r.json().get("contact_list", [])
+            if not cl:
+                break
+            contacts.extend(cl)
+            if len(cl) < 100:
+                break
+    except Exception as e:
+        log.error("dhd-retry: cannot read Declan contacts: %s" % e)
+        return 0
+
+    ctwa = []
+    for c in contacts:
+        prm = {x.get("name"): str(x.get("value") or "").strip()
+               for x in (c.get("customParams") or [])}
+        if not prm.get("source_id") or prm.get("lead_source"):
+            continue
+        wa = "".join(ch for ch in str(c.get("wAid") or "") if ch.isdigit())
+        if wa:
+            ctwa.append((wa, _name_key(c.get("fullName"))))
+
+    sent_count = 0
+    for phone, fname, camp, sent in failed:
+        key = _name_key(fname)
+        if not key:
+            continue
+        matches = [w for w, n in ctwa if n and (n == key or n.startswith(key) or key.startswith(n))]
+        matches = [w for w in matches if w != phone]
+        if len(matches) != 1:
+            log.warning("dhd-retry: %s (%s) FAILED - %d candidate(s), skipping"
+                        % (phone, fname, len(matches)))
+            continue
+        target = matches[0]
+        tmpl = _DHD_TEMPLATE_FOR_SOURCE.get(camp)
+        if not tmpl:
+            continue
+        if DHD_RETRY_DRY_RUN:
+            log.info("dhd-retry [DRY RUN] would resend %s to %s (was %s, %s)"
+                     % (tmpl, target, phone, fname))
+            continue
+        st = send_w0(target, fname, tmpl,
+                     api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        if st == "ok":
+            set_lead_attributes(target, camp,
+                                api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+            append_w0_tracking_row(service, phone, fname, camp.upper(), "w0 resent")
+            log.info("dhd-retry: resent %s to %s (was %s, %s)" % (tmpl, target, phone, fname))
+            sent_count += 1
+        else:
+            log.warning("dhd-retry: resend to %s returned %s" % (target, st))
+    return sent_count
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
