@@ -537,6 +537,9 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         dhd_src = DHD_SOURCE.get(template)
         if status == "ok" and dhd_src:
             set_lead_attributes(raw_phone, dhd_src, api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        if status == "ok" and service:
+            append_w0_tracking_row(service, raw_phone, first_name,
+                                   (dhd_src or declan_template).upper(), "w0 sent")
         return status
     if False and is_out_of_hours() and template in W0W_MAP:
         w0w_template   = W0W_MAP[template]
