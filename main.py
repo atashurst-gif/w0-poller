@@ -1351,9 +1351,114 @@ def _appt_dt(dstr, tstr):
         return None
 
 
+DECLAN_CB_SHEET_ID = os.getenv("DECLAN_CB_SHEET_ID",
+                               "1cdNzI9P8fe0ejREZtm26ZIWgdi7atAyHHmOlckxRDHU")
+
+REMINDER_SHEETS = [
+    {"label": "regen", "sheet_id": APPS2_SHEET_ID, "tab": APPS2_TAB,
+     "rng": "A:W", "name": 2, "phone": 3, "appt": 7, "time": 8,
+     "answered": 9, "stamp": 22, "stamp_col": "W",
+     "template": os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins"),
+     "param": "first_name", "wati": "regen"},
+    {"label": "declan", "sheet_id": DECLAN_CB_SHEET_ID, "tab": "Sheet1",
+     "rng": "A:K", "name": 2, "phone": 3, "appt": 6, "time": 7,
+     "answered": 8, "stamp": 10, "stamp_col": "K",
+     "template": os.getenv("DECLAN_REMINDER_TEMPLATE", "30min_reminder"),
+     "param": None, "wati": "declan"},
+]
+
+
+def _reminders_for_sheet(service, cfg) -> int:
+    now = datetime.datetime.now(UK_TZ)
+    try:
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=cfg["sheet_id"],
+            range="'" + cfg["tab"] + "'" + "!" + cfg["rng"]).execute().get("values", [])
+    except Exception as e:
+        log.error("reminder[%s]: cannot read sheet: %s" % (cfg["label"], e))
+        return 0
+
+    api_url = WATI_API_URL_DECLAN if cfg["wati"] == "declan" else None
+    token = WATI_TOKEN_DECLAN if cfg["wati"] == "declan" else None
+    if cfg["wati"] == "declan" and (not api_url or not token):
+        return 0
+
+    sent = 0
+    stamps = []
+    for i, r in enumerate(rows[1:], start=2):
+        def g(n):
+            return r[n].strip() if n < len(r) else ""
+        if g(cfg["stamp"]) or g(cfg["answered"]):
+            continue
+        phone, appt, tm = g(cfg["phone"]), g(cfg["appt"]), g(cfg["time"])
+        if not phone or not appt or not tm:
+            continue
+        due = _appt_dt(appt, tm)
+        if due is None:
+            continue
+        mins = (due - now).total_seconds() / 60.0
+        if mins < 25 or mins > 35:
+            continue
+        ph = format_phone(phone)
+        if not is_valid_phone(ph):
+            continue
+        first = (g(cfg["name"]).split()[0].title() if g(cfg["name"]).strip() else "there")
+        if REMINDER_DRY_RUN:
+            log.info("reminder[%s] [DRY RUN] would send %s to %s (%s) for %s %s"
+                     % (cfg["label"], cfg["template"], ph, first, appt, tm))
+            continue
+        st = _send_reminder(ph, first, cfg, api_url, token)
+        if st == "ok":
+            stamps.append({"range": "'" + cfg["tab"] + "'" + "!" + cfg["stamp_col"] + str(i),
+                           "values": [[now.strftime("%d/%m/%Y %H:%M")]]})
+            log.info("reminder[%s]: sent to %s (%s) for %s %s"
+                     % (cfg["label"], ph, first, appt, tm))
+            sent += 1
+        else:
+            log.warning("reminder[%s]: send to %s returned %s" % (cfg["label"], ph, st))
+
+    if stamps:
+        try:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=cfg["sheet_id"],
+                body={"valueInputOption": "RAW", "data": stamps}).execute()
+        except Exception as e:
+            log.error("reminder[%s]: stamp failed: %s" % (cfg["label"], e))
+    return sent
+
+
+def _send_reminder(phone, first_name, cfg, api_url, token) -> str:
+    """Template send that supports a no-parameter template."""
+    formatted = format_phone(phone)
+    url = (api_url or WATI_API_URL) + "/api/v2/sendTemplateMessages"
+    headers = {"Authorization": "Bearer " + (token or WATI_TOKEN),
+               "Content-Type": "application/json"}
+    receiver = {"whatsappNumber": formatted}
+    if cfg["param"]:
+        receiver["customParams"] = [{"name": cfg["param"], "value": first_name}]
+    payload = {"template_name": cfg["template"],
+               "broadcast_name": "rem_" + cfg["template"] + "_" + formatted[-4:],
+               "receivers": [receiver]}
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code in (200, 201):
+            return "ok"
+        log.warning("reminder: WATI %s for %s: %s" % (r.status_code, formatted, r.text[:160]))
+        return "retry"
+    except Exception as e:
+        log.warning("reminder: send failed for %s: %s" % (formatted, e))
+        return "retry"
+
+
 def send_callback_reminders(service) -> int:
-    """30 minutes before a booked callback, remind the client. Apps 2.0 only.
-    Skips rows with an Answered value (already chased) and rows already stamped."""
+    total = 0
+    for cfg in REMINDER_SHEETS:
+        total += _reminders_for_sheet(service, cfg)
+    return total
+
+
+def _send_callback_reminders_legacy(service) -> int:
+    """Superseded by REMINDER_SHEETS; kept for reference."""
     now = datetime.datetime.now(UK_TZ)
     try:
         rows = service.spreadsheets().values().get(
