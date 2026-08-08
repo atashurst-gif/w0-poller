@@ -311,15 +311,15 @@ WATCH_TABS = [
     },
     # ---- DHD (Declan) 5-campaign W0s: Created(0) FullName(1) Email(2) Number(3) ----
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CT1",
-     "template": "council_tax_dhd_w0",    "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "lg_dhd_w0", "lead_source": "dhd_ct",            "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD UTI1",
-     "template": "utility_w0",            "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "lg_dhd_w0", "lead_source": "dhd_utility",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD BAI1",
-     "template": "bailiff_dhd_w0",        "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "lg_dhd_w0", "lead_source": "dhd_bailiff",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DC FORM1",
-     "template": "debt_collector_dhd_w0", "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "lg_dhd_w0", "lead_source": "dhd_dc",            "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CON1",
-     "template": "consolidation_dhd_w0",  "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "lg_dhd_w0", "lead_source": "dhd_consolidation", "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
 ]
 
 # ─────────────────────────────────────────────
@@ -436,6 +436,7 @@ def send_w0(phone: str, first_name: str, template: str, api_url: str = None, tok
         "Content-Type": "application/json",
     }
     TEMPLATE_PARAM = {
+        "lg_dhd_w0": "first_name",
         "council_tax_dhd_w0": "name",
         "utility_w0": "name",
         "bailiff_dhd_w0": "name",
@@ -534,7 +535,8 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             "debt_collector_dhd_w0": "dhd_dc",
             "consolidation_dhd_w0": "dhd_consolidation",
         }
-        dhd_src = DHD_SOURCE.get(template)
+        tab_src = tab_cfg.get("lead_source") or ""
+        dhd_src = tab_src if tab_src.startswith("dhd_") else DHD_SOURCE.get(template)
         if status == "ok" and dhd_src:
             set_lead_attributes(raw_phone, dhd_src, api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
         if status == "ok" and service:
@@ -1193,11 +1195,11 @@ DHD_RETRY_DRY_RUN = os.getenv("DHD_RETRY_DRY_RUN", "1") == "1"
 DHD_RETRY_WINDOW_HOURS = int(os.getenv("DHD_RETRY_WINDOW_HOURS", "6"))
 
 _DHD_TEMPLATE_FOR_SOURCE = {
-    "dhd_ct": "council_tax_dhd_w0",
-    "dhd_utility": "utility_w0",
-    "dhd_bailiff": "bailiff_dhd_w0",
-    "dhd_dc": "debt_collector_dhd_w0",
-    "dhd_consolidation": "consolidation_dhd_w0",
+    "dhd_ct": "lg_dhd_w0",
+    "dhd_utility": "lg_dhd_w0",
+    "dhd_bailiff": "lg_dhd_w0",
+    "dhd_dc": "lg_dhd_w0",
+    "dhd_consolidation": "lg_dhd_w0",
 }
 
 
