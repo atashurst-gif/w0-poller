@@ -6,6 +6,7 @@ Runs standalone alongside wati_sequence and gmail_monitor.
 """
 
 import os
+import socket
 import re
 import json
 import time
@@ -327,6 +328,9 @@ WATCH_TABS = [
 # ─────────────────────────────────────────────
 
 def get_sheets_service():
+    # No timeout on the Google client blocks the whole poll loop if a sheet read
+    # stalls (hung the poller 08/08 when Declan's callback sheet joined the loop).
+    socket.setdefaulttimeout(int(os.getenv("SHEETS_TIMEOUT", "30")))
     sa_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "")
     if sa_b64:
         padded = sa_b64 + "=" * (-len(sa_b64) % 4)
