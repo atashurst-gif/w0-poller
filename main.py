@@ -1535,7 +1535,8 @@ def main():
             sync_cbna(service)
             sync_josh_bookings(service)
             retry_failed_dhd_w0(service)
-            send_callback_reminders(service)
+            if os.getenv("REMINDER_ENABLED", "0") == "1":
+                send_callback_reminders(service)
             purge_josh_from_apps2(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
