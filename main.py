@@ -956,6 +956,20 @@ def _cbna_for_sheet(service, cfg) -> int:
         if cur_step >= 5:
             continue
 
+        nxt = cur_step + 1
+        step_no, ukdt_t, bst_t, param, delay_min = CBNA_SEQUENCE[nxt - 1]
+        if nxt == 1:
+            due = True
+        else:
+            if last_dt is None:
+                continue
+            due = now >= (last_dt + datetime.timedelta(minutes=delay_min))
+        if not due:
+            continue
+
+        # Reply-check AFTER the due gate. Checking every mid-sequence row every
+        # cycle burned ~200k WATI calls/month; a reply only ever stops the next
+        # send, so checking at due time gives the same outcome.
         if cur_step and _cbna_has_replied(phone, last_dt):
             resp_col = resp_cols.get(cur_step)
             if resp_col is not None:
@@ -969,17 +983,6 @@ def _cbna_for_sheet(service, cfg) -> int:
                         valueInputOption="RAW",
                         body={"values": [[stamp]]}).execute()
                     log.info("%s: row %s reply -> Response%s %s" % (tag, i, cur_step, stamp))
-            continue
-
-        nxt = cur_step + 1
-        step_no, ukdt_t, bst_t, param, delay_min = CBNA_SEQUENCE[nxt - 1]
-        if nxt == 1:
-            due = True
-        else:
-            if last_dt is None:
-                continue
-            due = now >= (last_dt + datetime.timedelta(minutes=delay_min))
-        if not due:
             continue
 
         campaign = g(cfg["campaign_col"]).upper()
