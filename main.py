@@ -1303,13 +1303,17 @@ REMINDER_TEMPLATE = os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins")
 
 
 def _appt_dt(dstr, tstr):
-    """Parse 'DD-MM-YYYY' + 'HH:MM' into a UK-aware datetime. None if unusable."""
+    """Parse 'DD-MM-YYYY' or 'DD/MM/YYYY' plus 'HH:MM' or '9:00 AM'. None if unusable."""
     d = str(dstr or "").strip().replace("/", "-")
-    t = str(tstr or "").strip()
-    if not d or not t or t.upper() == "NOW":
+    t = str(tstr or "").strip().upper()
+    if not d or not t or t == "NOW":
         return None
     if ":" not in t:
         return None
+    ampm = ""
+    if t.endswith("AM") or t.endswith("PM"):
+        ampm = t[-2:]
+        t = t[:-2].strip()
     for fmt in ("%d-%m-%Y", "%d-%m-%y"):
         try:
             base = datetime.datetime.strptime(d, fmt)
@@ -1320,7 +1324,12 @@ def _appt_dt(dstr, tstr):
         return None
     try:
         hh, mm = t.split(":")[0:2]
-        return base.replace(hour=int(hh), minute=int(mm), tzinfo=UK_TZ)
+        hh, mm = int(hh), int(mm)
+        if ampm == "PM" and hh != 12:
+            hh += 12
+        if ampm == "AM" and hh == 12:
+            hh = 0
+        return base.replace(hour=hh, minute=mm, tzinfo=UK_TZ)
     except Exception:
         return None
 
@@ -1334,12 +1343,27 @@ REMINDER_SHEETS = [
      "answered": 9, "stamp": 22, "stamp_col": "W",
      "template": os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins"),
      "param": "first_name", "wati": "regen"},
-    {"label": "declan", "sheet_id": DECLAN_CB_SHEET_ID, "tab": "Sheet1",
-     "rng": "A:K", "name": 2, "phone": 3, "appt": 6, "time": 7,
-     "answered": 8, "stamp": 10, "stamp_col": "K",
+    {"label": "declan", "sheet_id": DECLAN_CB_SHEET_ID, "tab": "CALLBACKS",
+     "rng": "A:H", "name": 0, "phone": 3, "appt": 5, "time": 4,
+     "answered": 6, "stamp": None, "stamp_col": None,
      "template": os.getenv("DECLAN_REMINDER_TEMPLATE", "30min_reminder"),
      "param": None, "wati": "declan"},
 ]
+
+
+_reminded = {}  # {date: {phone}} — for sheets with no stamp column
+
+
+def _already_reminded(phone, now):
+    today = now.date()
+    for d in list(_reminded):
+        if d != today:
+            del _reminded[d]
+    return phone in _reminded.get(today, set())
+
+
+def _mark_reminded(phone, now):
+    _reminded.setdefault(now.date(), set()).add(phone)
 
 
 def _reminders_for_sheet(service, cfg) -> int:
@@ -1362,7 +1386,9 @@ def _reminders_for_sheet(service, cfg) -> int:
     for i, r in enumerate(rows[1:], start=2):
         def g(n):
             return r[n].strip() if n < len(r) else ""
-        if g(cfg["stamp"]) or g(cfg["answered"]):
+        if cfg["stamp"] is not None and g(cfg["stamp"]):
+            continue
+        if g(cfg["answered"]) and g(cfg["answered"]) != "-":
             continue
         phone, appt, tm = g(cfg["phone"]), g(cfg["appt"]), g(cfg["time"])
         if not phone or not appt or not tm:
@@ -1376,6 +1402,8 @@ def _reminders_for_sheet(service, cfg) -> int:
         ph = format_phone(phone)
         if not is_valid_phone(ph):
             continue
+        if cfg["stamp"] is None and _already_reminded(ph, now):
+            continue
         first = (g(cfg["name"]).split()[0].title() if g(cfg["name"]).strip() else "there")
         if REMINDER_DRY_RUN:
             log.info("reminder[%s] [DRY RUN] would send %s to %s (%s) for %s %s"
@@ -1383,8 +1411,11 @@ def _reminders_for_sheet(service, cfg) -> int:
             continue
         st = _send_reminder(ph, first, cfg, api_url, token)
         if st == "ok":
-            stamps.append({"range": "'" + cfg["tab"] + "'" + "!" + cfg["stamp_col"] + str(i),
-                           "values": [[now.strftime("%d/%m/%Y %H:%M")]]})
+            if cfg["stamp"] is None:
+                _mark_reminded(ph, now)
+            if cfg["stamp_col"]:
+                stamps.append({"range": "'" + cfg["tab"] + "'" + "!" + cfg["stamp_col"] + str(i),
+                               "values": [[now.strftime("%d/%m/%Y %H:%M")]]})
             log.info("reminder[%s]: sent to %s (%s) for %s %s"
                      % (cfg["label"], ph, first, appt, tm))
             sent += 1
