@@ -75,6 +75,7 @@ UKDT_SHEET_ID  = os.getenv("UKDT_SHEET_ID", "11lc2uiVgJrKE_tQE5BE-JdsMT9kdjCfXny
 UKDT_TEMPLATE  = "ukdt_w0"
 AUTOMATION_SHEET_ID = os.getenv("AUTOMATION_SHEET_ID", "1bggrSflZQa3ZCng6TQXbf1vNrnQWDnOBZcjDoCcjdf4")
 AUTOMATION_TAB = os.getenv("AUTOMATION_TAB", "Sheet1")
+DECLAN_AUTOMATION_SHEET_ID = os.getenv("DECLAN_AUTOMATION_SHEET_ID", "1FsEIcfd8eY3muNLbTd31qBEcT0irKYz5dNUAffaSoJA")
 W0_TRACKING_SHEET_ID = os.getenv("W0_TRACKING_SHEET_ID", AUTOMATION_SHEET_ID)
 W0_TRACKING_TAB = os.getenv("W0_TRACKING_TAB", "W0 Tracking")
 BOOKING_PENDING_STATUS = "booking pending"
@@ -546,6 +547,25 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         if status == "ok" and service:
             append_w0_tracking_row(service, raw_phone, first_name,
                                    (dhd_src or declan_template).upper(), "w0 sent")
+        # Enrol DHD leads into Declan's nurture sequence (step 0 = W0 already sent).
+        if status == "ok" and service and dhd_src:
+            seq_tab = ("DHD BAI AUTOMATION" if dhd_src == "dhd_bailiff"
+                       else "DHD CT AUTOMATION")
+            try:
+                service.spreadsheets().values().append(
+                    spreadsheetId=DECLAN_AUTOMATION_SHEET_ID,
+                    range="'" + seq_tab + "'" + "!A1",
+                    valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                    body={"values": [[
+                        datetime.datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M"),
+                        first_name or "there",
+                        format_phone(raw_phone),
+                        "", "0", "",
+                    ]]}).execute()
+                log.info("dhd-seq: enrolled %s (%s) in %s"
+                         % (format_phone(raw_phone), dhd_src, seq_tab))
+            except Exception as e:
+                log.error("dhd-seq: enrol failed for %s: %s" % (raw_phone, e))
         return status
     if False and is_out_of_hours() and template in W0W_MAP:
         w0w_template   = W0W_MAP[template]
