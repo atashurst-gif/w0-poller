@@ -313,11 +313,11 @@ WATCH_TABS = [
     },
     # ---- DHD (Declan) 5-campaign W0s: Created(0) FullName(1) Email(2) Number(3) ----
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CT1",
-     "template": "lg_dhd_w0", "lead_source": "dhd_ct",            "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "dhd_ct_instant", "lead_source": "dhd_ct",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD UTI1",
      "template": "lg_dhd_w0", "lead_source": "dhd_utility",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD BAI1",
-     "template": "lg_dhd_w0", "lead_source": "dhd_bailiff",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "dhd_bai_instant", "lead_source": "dhd_bailiff", "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DC FORM1",
      "template": "lg_dhd_w0", "lead_source": "dhd_dc",            "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CON1",
@@ -442,6 +442,8 @@ def send_w0(phone: str, first_name: str, template: str, api_url: str = None, tok
     }
     TEMPLATE_PARAM = {
         "lg_dhd_w0": "first_name",
+        "dhd_ct_instant": "first_name",
+        "dhd_bai_instant": "first_name",
         "council_tax_dhd_w0": "name",
         "utility_w0": "name",
         "bailiff_dhd_w0": "name",
@@ -548,7 +550,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             append_w0_tracking_row(service, raw_phone, first_name,
                                    (dhd_src or declan_template).upper(), "w0 sent")
         # Enrol DHD leads into Declan's nurture sequence (step 0 = W0 already sent).
-        if status == "ok" and service and dhd_src:
+        if status == "ok" and service and dhd_src in ("dhd_ct", "dhd_bailiff"):
             seq_tab = ("DHD BAI AUTOMATION" if dhd_src == "dhd_bailiff"
                        else "DHD CT AUTOMATION")
             try:
@@ -1187,9 +1189,9 @@ DHD_RETRY_DRY_RUN = os.getenv("DHD_RETRY_DRY_RUN", "1") == "1"
 DHD_RETRY_WINDOW_HOURS = int(os.getenv("DHD_RETRY_WINDOW_HOURS", "6"))
 
 _DHD_TEMPLATE_FOR_SOURCE = {
-    "dhd_ct": "lg_dhd_w0",
+    "dhd_ct": "dhd_ct_instant",
     "dhd_utility": "lg_dhd_w0",
-    "dhd_bailiff": "lg_dhd_w0",
+    "dhd_bailiff": "dhd_bai_instant",
     "dhd_dc": "lg_dhd_w0",
     "dhd_consolidation": "lg_dhd_w0",
 }
