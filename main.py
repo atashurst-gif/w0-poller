@@ -550,9 +550,12 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             append_w0_tracking_row(service, raw_phone, first_name,
                                    (dhd_src or declan_template).upper(), "w0 sent")
         # Enrol DHD leads into Declan's nurture sequence (step 0 = W0 already sent).
-        if status == "ok" and service and dhd_src in ("dhd_ct", "dhd_bailiff"):
-            seq_tab = ("DHD BAI AUTOMATION" if dhd_src == "dhd_bailiff"
-                       else "DHD CT AUTOMATION")
+        # Explicit whitelist: no default branch, so an unmapped source can
+        # never fall through into the CT sequence (see Karen/Ismael 26/08).
+        DHD_SEQ_TAB = {"dhd_ct": "DHD CT AUTOMATION",
+                       "dhd_bailiff": "DHD BAI AUTOMATION"}
+        seq_tab = DHD_SEQ_TAB.get(dhd_src)
+        if status == "ok" and service and seq_tab:
             try:
                 service.spreadsheets().values().append(
                     spreadsheetId=DECLAN_AUTOMATION_SHEET_ID,
