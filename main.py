@@ -554,7 +554,12 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         # never fall through into the CT sequence (see Karen/Ismael 26/08).
         DHD_SEQ_TAB = {"dhd_ct": "DHD CT AUTOMATION",
                        "dhd_bailiff": "DHD BAI AUTOMATION"}
-        seq_tab = DHD_SEQ_TAB.get(dhd_src)
+        # Declan's non-DHD leads (UKDT CT + BST bailiff phoenix) enrol into his
+        # own sequence tabs. Keyed off the same route_declan decision that chose
+        # the tenant, so routing and enrolment can never drift apart.
+        DECLAN_SEQ_TAB = {"UKDTCTD1 (Dec)": "UKDT AUTOMATION",
+                          "BST Form Meta": "BST AUTOMATION"}
+        seq_tab = DHD_SEQ_TAB.get(dhd_src) or DECLAN_SEQ_TAB.get(tab)
         if status == "ok" and service and seq_tab:
             try:
                 service.spreadsheets().values().append(
@@ -562,7 +567,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
                     range="'" + seq_tab + "'" + "!A1",
                     valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                     body={"values": [[
-                        datetime.datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M"),
+                        datetime.datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M"),
                         first_name or "there",
                         format_phone(raw_phone),
                         "", "0", "",
