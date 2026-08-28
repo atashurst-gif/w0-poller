@@ -562,7 +562,9 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         seq_tab = DHD_SEQ_TAB.get(dhd_src) or DECLAN_SEQ_TAB.get(tab)
         if status == "ok" and service and seq_tab:
             try:
-                service.spreadsheets().values().append(
+                # Append A:C only. Writing D would overwrite the STATUS cell and
+                # strip its dropdown validation, so STEP is written to E after.
+                res = service.spreadsheets().values().append(
                     spreadsheetId=DECLAN_AUTOMATION_SHEET_ID,
                     range="'" + seq_tab + "'" + "!A1",
                     valueInputOption="RAW", insertDataOption="INSERT_ROWS",
@@ -570,8 +572,17 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
                         datetime.datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M"),
                         first_name or "there",
                         format_phone(raw_phone),
-                        "", "0", "",
                     ]]}).execute()
+                upd = (res.get("updates", {}) or {}).get("updatedRange", "")
+                rownum = "".join(c for c in upd.split("!")[-1].split(":")[0] if c.isdigit())
+                if rownum:
+                    service.spreadsheets().values().update(
+                        spreadsheetId=DECLAN_AUTOMATION_SHEET_ID,
+                        range="'" + seq_tab + "'" + "!E" + rownum,
+                        valueInputOption="RAW",
+                        body={"values": [["0"]]}).execute()
+                else:
+                    log.error("dhd-seq: could not derive row from %r, STEP not set" % upd)
                 log.info("dhd-seq: enrolled %s (%s) in %s"
                          % (format_phone(raw_phone), dhd_src, seq_tab))
             except Exception as e:
