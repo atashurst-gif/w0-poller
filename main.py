@@ -98,6 +98,18 @@ def is_out_of_hours(now=None) -> bool:
     if wd == 4:            return hr >= 14
     return True
 
+def is_declan_out_of_hours(now=None) -> bool:
+    """DHD out-of-hours: 20:00-08:00 any day, plus all of Saturday and Sunday."""
+    if os.getenv("DHD_OOH_FORCE", "0") == "1":
+        return True
+    now = now or datetime.datetime.now(UK_TZ)
+    if now.weekday() >= 5:
+        return True
+    return now.hour >= 20 or now.hour < 8
+
+DHD_OOH_ENABLED = os.getenv("DHD_OOH_ENABLED", "1") == "1"
+DHD_OOH_TEMPLATE = os.getenv("DHD_OOH_TEMPLATE", "cb_ins_all")
+
 def booking_window_for(now=None, lead_source: str = "ukdt") -> str:
     # Routing by ENQUIRY day/time (only reached when is_out_of_hours() is True):
     #   Mon-Thu >=18:00  -> next day        (nextday event)
@@ -533,6 +545,16 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
             return "skip"
         declan_template = BST_TEMPLATE_DECLAN if tab == "BST Form Meta" else template
+        # DHD leads arriving out of hours get the callback-only instant
+        # (cb_ins_all, quick-reply "Set a callback" -> DHD BOOK CALLBACK bot)
+        # instead of the normal W0. Enrolment below is unchanged, so the
+        # nurture sequence still runs if they don't book.
+        if (DHD_OOH_ENABLED
+                and (tab_cfg.get("lead_source") or "").startswith("dhd_")
+                and is_declan_out_of_hours()):
+            log.info("dhd-ooh: %s (%s) out of hours -> %s"
+                     % (format_phone(raw_phone), tab_cfg.get("lead_source"), DHD_OOH_TEMPLATE))
+            declan_template = DHD_OOH_TEMPLATE
         status = send_w0(raw_phone, first_name, declan_template,
                          api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
         DHD_SOURCE = {
