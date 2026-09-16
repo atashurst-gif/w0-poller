@@ -1663,7 +1663,8 @@ def sync_cbs_today():
     gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_TODAY_TAB)
 
     # ── day rollover: drop rows whose Appointment is not today ─────────
-    stale = [i for i, c in enumerate(cur) if c[3].strip() and c[7].strip() != today]
+    stale = [i for i, c in enumerate(cur)
+             if (c[3].strip() and c[7].strip() != today) or not any(x.strip() for x in c)]
     if stale:
         if CBS_TODAY_DRY_RUN:
             log.info("cbs-today: [DRY RUN] would remove %d row(s) not dated %s" % (len(stale), today))
@@ -1694,7 +1695,7 @@ def sync_cbs_today():
         return
     for dt, r in missing:
         pos = 0
-        while pos < len(cur) and cur[pos][3].strip() and _cbs_sort_dt(cur[pos], now) <= dt:
+        while pos < len(cur) and (not cur[pos][3].strip() or _cbs_sort_dt(cur[pos], now) <= dt):
             pos += 1
         rownum = CBS_TODAY_FIRST_ROW + pos
         if CBS_TODAY_DRY_RUN:
