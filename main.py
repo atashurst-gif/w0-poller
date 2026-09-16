@@ -1581,6 +1581,205 @@ def _send_callback_reminders_legacy(service) -> int:
     return sent
 
 
+# ─────────────────────────────────────────────────────────────────────
+# CB'S TODAY  +  CB STATS
+#   06:00 UK: clear CB'S TODAY (values only, formatting/validation kept)
+#             and rebuild it from Apps 2.0 rows whose Appointment == today,
+#             sorted by time. Then rebuild the CB STATS answer-rate tab.
+#   Every cycle: any Apps 2.0 row for today that is not yet in CB'S TODAY
+#             is INSERTED at the correct time position (real row insert, so
+#             rows already worked keep their colours/handler entries).
+#   Writes only to CB'S TODAY and CB STATS. Never writes to Apps 2.0.
+# ─────────────────────────────────────────────────────────────────────
+CBS_TODAY_ENABLED   = os.getenv("CBS_TODAY_ENABLED", "1") == "1"
+CBS_TODAY_DRY_RUN   = os.getenv("CBS_TODAY_DRY_RUN", "1") == "1"
+CBS_TODAY_HOUR      = int(os.getenv("CBS_TODAY_HOUR", "8"))
+CBS_TODAY_MINUTE    = int(os.getenv("CBS_TODAY_MINUTE", "45"))
+CBS_APPS2_SHEET_ID  = os.getenv("CBS_APPS2_SHEET_ID", "16qnJ842lFAo-4FVhloipJMFdCs7Spc2hFgoWnVGwVUs")
+CBS_TODAY_TAB       = "CB'S TODAY"
+CBS_TODAY_FIRST_ROW = 4          # rows 1-3 are not data
+CBS_STATS_TAB       = "CB STATS"
+_CBS_STATE_FILE     = os.path.join(os.path.dirname(SEEN_FILE) or ".", "cbs_today.json")
+_cbs_last_insert_check = None
+
+
+def _cbs_state():
+    import json
+    try:
+        return json.load(open(_CBS_STATE_FILE))
+    except Exception:
+        return {}
+
+
+def _cbs_save_state(st):
+    import json
+    try:
+        json.dump(st, open(_CBS_STATE_FILE, "w"))
+    except Exception as e:
+        log.warning("cbs-today: could not save state: %s" % e)
+
+
+def _cbs_gid(svc, sheet_id, title):
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    for sh in meta["sheets"]:
+        if sh["properties"]["title"] == title:
+            return sh["properties"]["sheetId"]
+    return None
+
+
+def _cbs_key(r):
+    ph = "".join(c for c in str(r[3]) if c.isdigit())[-9:] if len(r) > 3 else ""
+    return (ph, (r[8] if len(r) > 8 else "").strip())
+
+
+def _cbs_sort_dt(r, now):
+    dt = _appt_dt(r[7], r[8]) if len(r) > 8 else None
+    return dt or now.replace(hour=23, minute=59, second=0, microsecond=0)
+
+
+def sync_cbs_today():
+    if not CBS_TODAY_ENABLED:
+        return
+    now   = datetime.datetime.now(UK_TZ)
+    today = now.strftime("%d/%m/%Y")
+    svc   = get_sheets_service()
+    rows  = svc.spreadsheets().values().get(
+        spreadsheetId=CBS_APPS2_SHEET_ID, range="'Apps 2.0'!A:L").execute().get("values", [])
+
+    todays = []
+    for r in rows[1:]:
+        r = (r + [""] * 12)[:12]
+        if r[7].strip() != today or not r[3].strip():
+            continue
+        todays.append((_cbs_sort_dt(r, now), r))
+    todays.sort(key=lambda x: x[0])
+
+    st = _cbs_state()
+    rng = "'" + CBS_TODAY_TAB + "'!A%d:L" % CBS_TODAY_FIRST_ROW
+
+    # ── 06:00 rebuild ────────────────────────────────────────────────
+    if (now.hour, now.minute) >= (CBS_TODAY_HOUR, CBS_TODAY_MINUTE) and st.get("rebuilt") != today:
+        vals = [r for _, r in todays]
+        if CBS_TODAY_DRY_RUN:
+            log.info("cbs-today: [DRY RUN] would rebuild %s with %d rows for %s"
+                     % (CBS_TODAY_TAB, len(vals), today))
+            for r in vals:
+                log.info("cbs-today: [DRY RUN]   %s | %s | %s" % (r[8], r[2][:20], r[3]))
+        else:
+            svc.spreadsheets().values().clear(spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute()
+            if vals:
+                svc.spreadsheets().values().update(
+                    spreadsheetId=CBS_APPS2_SHEET_ID, range=rng.split(":")[0],
+                    valueInputOption="RAW", body={"values": vals}).execute()
+            log.info("cbs-today: rebuilt %s with %d rows for %s" % (CBS_TODAY_TAB, len(vals), today))
+        st["rebuilt"] = today
+        if not CBS_TODAY_DRY_RUN:
+            _cbs_save_state(st)
+        try:
+            rebuild_cb_stats(svc, rows, now)
+        except Exception as e:
+            log.error("cb-stats: %s" % e)
+        return
+
+    # ── per-cycle top-up (only after today's rebuild has happened) ──
+    if st.get("rebuilt") != today and not CBS_TODAY_DRY_RUN:
+        return
+    cur = svc.spreadsheets().values().get(
+        spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
+    cur = [(c + [""] * 12)[:12] for c in cur]
+    have = {_cbs_key(c) for c in cur if c[3].strip()}
+    missing = [(dt, r) for dt, r in todays if _cbs_key(r) not in have]
+    if not missing:
+        return
+    gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_TODAY_TAB)
+    for dt, r in missing:
+        pos = 0
+        while pos < len(cur) and cur[pos][3].strip() and _cbs_sort_dt(cur[pos], now) <= dt:
+            pos += 1
+        rownum = CBS_TODAY_FIRST_ROW + pos
+        if CBS_TODAY_DRY_RUN:
+            log.info("cbs-today: [DRY RUN] would insert %s | %s | %s at row %d"
+                     % (r[8], r[2][:20], r[3], rownum))
+        else:
+            svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
+                {"insertDimension": {"range": {"sheetId": gid, "dimension": "ROWS",
+                                               "startIndex": rownum - 1, "endIndex": rownum},
+                                     "inheritFromBefore": pos > 0}}]}).execute()
+            svc.spreadsheets().values().update(
+                spreadsheetId=CBS_APPS2_SHEET_ID,
+                range="'" + CBS_TODAY_TAB + "'!A%d" % rownum,
+                valueInputOption="RAW", body={"values": [r]}).execute()
+            log.info("cbs-today: inserted %s | %s | %s at row %d" % (r[8], r[2][:20], r[3], rownum))
+        cur.insert(pos, r)
+
+
+def rebuild_cb_stats(svc, rows, now):
+    """CB STATS tab: daily (90d) / weekly (26w) / monthly answer rates from Apps 2.0.
+    Answer rate = Yes / (Yes + No). Today is excluded (still in progress)."""
+    import collections
+    today = now.date()
+    daily = collections.defaultdict(lambda: [0, 0, 0, 0])   # booked, yes, no, unmarked
+    for r in rows[1:]:
+        r = (r + [""] * 12)[:12]
+        d = None
+        for f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                d = datetime.datetime.strptime(r[7].strip()[:10], f).date(); break
+            except ValueError:
+                pass
+        if not d or d >= today or not r[3].strip():
+            continue
+        a = r[9].strip().lower()
+        c = daily[d]
+        c[0] += 1
+        if a == "yes":   c[1] += 1
+        elif a == "no":  c[2] += 1
+        else:            c[3] += 1
+
+    def row(label, c):
+        marked = c[1] + c[2]
+        rate = ("%d%%" % round(c[1] * 100.0 / marked)) if marked else ""
+        return [label, c[0], c[1], c[2], c[3], rate]
+
+    out = [["Period", "Booked", "Answered", "No answer", "Not marked", "Answer rate"]]
+    out.append(["DAILY (last 90 days)", "", "", "", "", ""])
+    for d in sorted(daily, reverse=True):
+        if (today - d).days > 90: continue
+        out.append(row(d.strftime("%d/%m/%Y"), daily[d]))
+
+    weekly = collections.defaultdict(lambda: [0, 0, 0, 0])
+    monthly = collections.defaultdict(lambda: [0, 0, 0, 0])
+    for d, c in daily.items():
+        wk = d - datetime.timedelta(days=d.weekday())
+        for i in range(4):
+            weekly[wk][i] += c[i]
+            monthly[(d.year, d.month)][i] += c[i]
+    out.append(["", "", "", "", "", ""])
+    out.append(["WEEKLY (w/c Monday, last 26)", "", "", "", "", ""])
+    for wk in sorted(weekly, reverse=True)[:26]:
+        out.append(row("w/c " + wk.strftime("%d/%m/%Y"), weekly[wk]))
+    out.append(["", "", "", "", "", ""])
+    out.append(["MONTHLY", "", "", "", "", ""])
+    for ym in sorted(monthly, reverse=True):
+        out.append(row(datetime.date(ym[0], ym[1], 1).strftime("%b %Y"), monthly[ym]))
+    out.append(["", "", "", "", "", ""])
+    out.append(["Updated " + now.strftime("%d/%m/%Y %H:%M"), "", "", "", "", ""])
+
+    if CBS_TODAY_DRY_RUN:
+        log.info("cb-stats: [DRY RUN] would write %d rows to %s" % (len(out), CBS_STATS_TAB))
+        return
+    if _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_STATS_TAB) is None:
+        svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
+            {"addSheet": {"properties": {"title": CBS_STATS_TAB}}}]}).execute()
+        log.info("cb-stats: created tab %s" % CBS_STATS_TAB)
+    svc.spreadsheets().values().clear(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                      range="'" + CBS_STATS_TAB + "'!A:F").execute()
+    svc.spreadsheets().values().update(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                       range="'" + CBS_STATS_TAB + "'!A1",
+                                       valueInputOption="RAW", body={"values": out}).execute()
+    log.info("cb-stats: wrote %d rows to %s" % (len(out), CBS_STATS_TAB))
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -1593,6 +1792,10 @@ def main():
             service = get_sheets_service()
             ensure_w0_tracking_sheet(service)
             total_fired = 0
+            try:
+                sync_cbs_today()
+            except Exception as e:
+                log.error("cbs-today: %s" % e)
             for tab_cfg in WATCH_TABS:
                 fired = poll_tab(service, tab_cfg, seen)
                 total_fired += fired
