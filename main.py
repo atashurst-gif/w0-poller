@@ -1664,7 +1664,7 @@ def sync_cbs_today():
 
     # ── day rollover: drop rows whose Appointment is not today ─────────
     stale = [i for i, c in enumerate(cur)
-             if (c[3].strip() and c[7].strip() != today) or not any(x.strip() for x in c)]
+             if not c[3].strip() or c[7].strip() != today]   # no number, or not today
     if stale:
         if CBS_TODAY_DRY_RUN:
             log.info("cbs-today: [DRY RUN] would remove %d row(s) not dated %s" % (len(stale), today))
@@ -1691,6 +1691,8 @@ def sync_cbs_today():
     # ── insert any of today's bookings not yet in the tab, in time order ─
     have = {_cbs_key(c) for c in cur if c[3].strip()}
     missing = [(dt, r) for dt, r in todays if _cbs_key(r) not in have]
+    seen_keys = set(); missing = [(dt, r) for dt, r in missing
+                                  if not (_cbs_key(r) in seen_keys or seen_keys.add(_cbs_key(r)))]
     if not missing:
         return
     for dt, r in missing:
@@ -1712,6 +1714,7 @@ def sync_cbs_today():
                 valueInputOption="RAW", body={"values": [r]}).execute()
             log.info("cbs-today: inserted %s | %s | %s at row %d" % (r[8], r[2][:20], r[3], rownum))
         cur.insert(pos, r)
+        have.add(_cbs_key(r))
 
 
 def _cbs_parse_date(v):
