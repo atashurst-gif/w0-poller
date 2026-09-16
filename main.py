@@ -1657,41 +1657,41 @@ def sync_cbs_today():
     st = _cbs_state()
     rng = "'" + CBS_TODAY_TAB + "'!A%d:L" % CBS_TODAY_FIRST_ROW
 
-    # ── 06:00 rebuild ────────────────────────────────────────────────
-    if (now.hour, now.minute) >= (CBS_TODAY_HOUR, CBS_TODAY_MINUTE) and st.get("rebuilt") != today:
-        vals = [r for _, r in todays]
+    cur = svc.spreadsheets().values().get(
+        spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
+    cur = [(c + [""] * 12)[:12] for c in cur]
+    gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_TODAY_TAB)
+
+    # ── day rollover: drop rows whose Appointment is not today ─────────
+    stale = [i for i, c in enumerate(cur) if c[3].strip() and c[7].strip() != today]
+    if stale:
         if CBS_TODAY_DRY_RUN:
-            log.info("cbs-today: [DRY RUN] would rebuild %s with %d rows for %s"
-                     % (CBS_TODAY_TAB, len(vals), today))
-            for r in vals:
-                log.info("cbs-today: [DRY RUN]   %s | %s | %s" % (r[8], r[2][:20], r[3]))
+            log.info("cbs-today: [DRY RUN] would remove %d row(s) not dated %s" % (len(stale), today))
         else:
-            svc.spreadsheets().values().clear(spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute()
-            if vals:
-                svc.spreadsheets().values().update(
-                    spreadsheetId=CBS_APPS2_SHEET_ID, range=rng.split(":")[0],
-                    valueInputOption="RAW", body={"values": vals}).execute()
-            log.info("cbs-today: rebuilt %s with %d rows for %s" % (CBS_TODAY_TAB, len(vals), today))
-        st["rebuilt"] = today
-        if not CBS_TODAY_DRY_RUN:
-            _cbs_save_state(st)
+            reqs = [{"deleteDimension": {"range": {"sheetId": gid, "dimension": "ROWS",
+                     "startIndex": CBS_TODAY_FIRST_ROW - 1 + i,
+                     "endIndex": CBS_TODAY_FIRST_ROW + i}}} for i in sorted(stale, reverse=True)]
+            svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                           body={"requests": reqs}).execute()
+            log.info("cbs-today: removed %d row(s) not dated %s" % (len(stale), today))
+        cur = [c for i, c in enumerate(cur) if i not in set(stale)]
+
+    # ── CB STATS once per day ──────────────────────────────────────────
+    last = st.get("stats_at", 0)
+    if now.timestamp() - last >= 300:
         try:
             rebuild_cb_stats(svc, rows, now)
         except Exception as e:
             log.error("cb-stats: %s" % e)
-        return
+        st["stats_at"] = now.timestamp()
+        if not CBS_TODAY_DRY_RUN:
+            _cbs_save_state(st)
 
-    # ── per-cycle top-up (only after today's rebuild has happened) ──
-    if st.get("rebuilt") != today and not CBS_TODAY_DRY_RUN:
-        return
-    cur = svc.spreadsheets().values().get(
-        spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
-    cur = [(c + [""] * 12)[:12] for c in cur]
+    # ── insert any of today's bookings not yet in the tab, in time order ─
     have = {_cbs_key(c) for c in cur if c[3].strip()}
     missing = [(dt, r) for dt, r in todays if _cbs_key(r) not in have]
     if not missing:
         return
-    gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_TODAY_TAB)
     for dt, r in missing:
         pos = 0
         while pos < len(cur) and cur[pos][3].strip() and _cbs_sort_dt(cur[pos], now) <= dt:
@@ -1713,71 +1713,171 @@ def sync_cbs_today():
         cur.insert(pos, r)
 
 
+def _cbs_parse_date(v):
+    v = str(v).strip()[:10]
+    for f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(v, f).date()
+        except ValueError:
+            pass
+    return None
+
+
 def rebuild_cb_stats(svc, rows, now):
-    """CB STATS tab: daily (90d) / weekly (26w) / monthly answer rates from Apps 2.0.
-    Answer rate = Yes / (Yes + No). Today is excluded (still in progress)."""
+    """CB STATS: one row per (date, platform, agent) from Apps 2.0, real dates,
+    today included. Columns A-G data; I = platform list, J = agent list
+    (both headed 'All') for the dashboard dropdowns."""
     import collections
-    today = now.date()
-    daily = collections.defaultdict(lambda: [0, 0, 0, 0])   # booked, yes, no, unmarked
+    agg = collections.defaultdict(lambda: [0, 0, 0, 0])   # booked, yes, no, unmarked
+    plats, agents = set(), set()
     for r in rows[1:]:
         r = (r + [""] * 12)[:12]
-        d = None
-        for f in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
-            try:
-                d = datetime.datetime.strptime(r[7].strip()[:10], f).date(); break
-            except ValueError:
-                pass
-        if not d or d >= today or not r[3].strip():
+        d = _cbs_parse_date(r[7])
+        if not d or not r[3].strip() or (now.date() - d).days > 400:
             continue
+        plat  = r[6].strip() or "(none)"
+        agent = r[5].strip() or "(none)"
         a = r[9].strip().lower()
-        c = daily[d]
+        c = agg[(d, plat, agent)]
         c[0] += 1
         if a == "yes":   c[1] += 1
         elif a == "no":  c[2] += 1
         else:            c[3] += 1
+        plats.add(plat); agents.add(agent)
 
-    def row(label, c):
-        marked = c[1] + c[2]
-        rate = ("%d%%" % round(c[1] * 100.0 / marked)) if marked else ""
-        return [label, c[0], c[1], c[2], c[3], rate]
-
-    out = [["Period", "Booked", "Answered", "No answer", "Not marked", "Answer rate"]]
-    out.append(["DAILY (last 90 days)", "", "", "", "", ""])
-    for d in sorted(daily, reverse=True):
-        if (today - d).days > 90: continue
-        out.append(row(d.strftime("%d/%m/%Y"), daily[d]))
-
-    weekly = collections.defaultdict(lambda: [0, 0, 0, 0])
-    monthly = collections.defaultdict(lambda: [0, 0, 0, 0])
-    for d, c in daily.items():
-        wk = d - datetime.timedelta(days=d.weekday())
-        for i in range(4):
-            weekly[wk][i] += c[i]
-            monthly[(d.year, d.month)][i] += c[i]
-    out.append(["", "", "", "", "", ""])
-    out.append(["WEEKLY (w/c Monday, last 26)", "", "", "", "", ""])
-    for wk in sorted(weekly, reverse=True)[:26]:
-        out.append(row("w/c " + wk.strftime("%d/%m/%Y"), weekly[wk]))
-    out.append(["", "", "", "", "", ""])
-    out.append(["MONTHLY", "", "", "", "", ""])
-    for ym in sorted(monthly, reverse=True):
-        out.append(row(datetime.date(ym[0], ym[1], 1).strftime("%b %Y"), monthly[ym]))
-    out.append(["", "", "", "", "", ""])
-    out.append(["Updated " + now.strftime("%d/%m/%Y %H:%M"), "", "", "", "", ""])
+    out = [["Date", "Platform", "Agent", "Booked", "Answered", "No answer", "Not marked"]]
+    for k in sorted(agg, reverse=True):
+        out.append([k[0].isoformat(), k[1], k[2]] + agg[k])
+    lists = [["All", "All"]]
+    pl, ag = sorted(plats), sorted(agents)
+    for i in range(max(len(pl), len(ag))):
+        lists.append([pl[i] if i < len(pl) else "", ag[i] if i < len(ag) else ""])
 
     if CBS_TODAY_DRY_RUN:
-        log.info("cb-stats: [DRY RUN] would write %d rows to %s" % (len(out), CBS_STATS_TAB))
+        log.info("cb-stats: [DRY RUN] would write %d rows to %s (%d platforms, %d agents)"
+                 % (len(out) - 1, CBS_STATS_TAB, len(pl), len(ag)))
         return
     if _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_STATS_TAB) is None:
         svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
             {"addSheet": {"properties": {"title": CBS_STATS_TAB}}}]}).execute()
         log.info("cb-stats: created tab %s" % CBS_STATS_TAB)
-    svc.spreadsheets().values().clear(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                      range="'" + CBS_STATS_TAB + "'!A:F").execute()
-    svc.spreadsheets().values().update(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                       range="'" + CBS_STATS_TAB + "'!A1",
-                                       valueInputOption="RAW", body={"values": out}).execute()
-    log.info("cb-stats: wrote %d rows to %s" % (len(out), CBS_STATS_TAB))
+    svc.spreadsheets().values().batchClear(spreadsheetId=CBS_APPS2_SHEET_ID, body={
+        "ranges": ["'" + CBS_STATS_TAB + "'!A:G", "'" + CBS_STATS_TAB + "'!I:J"]}).execute()
+    svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={
+        "valueInputOption": "USER_ENTERED",
+        "data": [{"range": "'" + CBS_STATS_TAB + "'!A1", "values": out},
+                 {"range": "'" + CBS_STATS_TAB + "'!I1", "values": lists},
+                 {"range": "'" + CBS_STATS_TAB + "'!L1",
+                  "values": [["Updated " + now.strftime("%d/%m/%Y %H:%M")]]}]}).execute()
+    log.info("cb-stats: wrote %d rows to %s" % (len(out) - 1, CBS_STATS_TAB))
+    try:
+        ensure_cb_dashboard(svc)
+    except Exception as e:
+        log.error("cb-dashboard: %s" % e)
+
+
+CBS_DASH_TAB = "CB DASHBOARD"
+CBS_PERIODS  = ["Today", "Yesterday", "This week", "Last week", "This month",
+                "Last month", "Last 7 days", "Last 30 days", "All time"]
+
+
+def ensure_cb_dashboard(svc):
+    """Build CB DASHBOARD once: dropdowns (B1:B3), KPIs (A6:B11), helper dates
+    (N1:N4), 31-day daily strip (A14:E44) and a line chart of daily answer rate."""
+    if _cbs_state().get("dashboard_built"):
+        return
+    ST = "'" + CBS_STATS_TAB + "'"
+    gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_DASH_TAB)
+    if gid is None:
+        res = svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
+            {"addSheet": {"properties": {"title": CBS_DASH_TAB}}}]}).execute()
+        gid = res["replies"][0]["addSheet"]["properties"]["sheetId"]
+        log.info("cb-dashboard: created tab %s" % CBS_DASH_TAB)
+
+    crit = "%s!A:A,\">=\"&$N$1,%s!A:A,\"<=\"&$N$2,%s!B:B,$N$3,%s!C:C,$N$4" % (ST, ST, ST, ST)
+    def kpi(col): return "=SUMIFS(%s!%s:%s,%s)" % (ST, col, col, crit)
+    top = [
+        ["Period",   "This week"],
+        ["Platform", "All"],
+        ["Agent",    "All"],
+        ["", ""],
+        ["CALLBACK STATS", ""],
+        ["Booked",      kpi("D")],
+        ["Answered",    kpi("E")],
+        ["No answer",   kpi("F")],
+        ["Not marked",  kpi("G")],
+        ["Answer rate", "=IF(B7+B8=0,\"\",B7/(B7+B8))"],
+        ["Marked",      "=IF(B6=0,\"\",(B7+B8)/B6)"],
+        ["", ""],
+        ["Date", "Booked", "Answered", "No answer", "Rate"],
+    ]
+    daily = []
+    for i in range(31):
+        r = 14 + i
+        dcrit = "%s!A:A,$A%d,%s!B:B,$N$3,%s!C:C,$N$4" % (ST, r, ST, ST)
+        daily.append([
+            "=IF($N$2-$N$1<%d,\"\",$N$2-%d)" % (i, i),
+            "=IF($A%d=\"\",\"\",SUMIFS(%s!D:D,%s))" % (r, ST, dcrit),
+            "=IF($A%d=\"\",\"\",SUMIFS(%s!E:E,%s))" % (r, ST, dcrit),
+            "=IF($A%d=\"\",\"\",SUMIFS(%s!F:F,%s))" % (r, ST, dcrit),
+            "=IF(OR($A%d=\"\",C%d+D%d=0),\"\",C%d/(C%d+D%d))" % (r, r, r, r, r, r),
+        ])
+    helper = [
+        ["=SWITCH($B$1,\"Today\",TODAY(),\"Yesterday\",TODAY()-1,\"This week\",TODAY()-WEEKDAY(TODAY(),2)+1,"
+         "\"Last week\",TODAY()-WEEKDAY(TODAY(),2)-6,\"This month\",DATE(YEAR(TODAY()),MONTH(TODAY()),1),"
+         "\"Last month\",EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),-1),\"Last 7 days\",TODAY()-6,"
+         "\"Last 30 days\",TODAY()-29,\"All time\",DATE(2024,1,1),TODAY())"],
+        ["=SWITCH($B$1,\"Today\",TODAY(),\"Yesterday\",TODAY()-1,\"This week\",TODAY(),"
+         "\"Last week\",TODAY()-WEEKDAY(TODAY(),2),\"This month\",TODAY(),"
+         "\"Last month\",DATE(YEAR(TODAY()),MONTH(TODAY()),1)-1,\"Last 7 days\",TODAY(),"
+         "\"Last 30 days\",TODAY(),\"All time\",TODAY(),TODAY())"],
+        ["=IF($B$2=\"All\",\"*\",$B$2)"],
+        ["=IF($B$3=\"All\",\"*\",$B$3)"],
+    ]
+    D = "'" + CBS_DASH_TAB + "'"
+    svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={
+        "valueInputOption": "USER_ENTERED",
+        "data": [{"range": D + "!A1", "values": top},
+                 {"range": D + "!A14", "values": daily},
+                 {"range": D + "!N1", "values": helper},
+                 {"range": D + "!M1", "values": [["start"], ["end"], ["platform"], ["agent"]]}]}).execute()
+
+    def rng(r0, r1, c0, c1):
+        return {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1,
+                "startColumnIndex": c0, "endColumnIndex": c1}
+    reqs = [
+        {"setDataValidation": {"range": rng(0, 1, 1, 2), "rule": {"condition": {"type": "ONE_OF_LIST",
+            "values": [{"userEnteredValue": p} for p in CBS_PERIODS]}, "showCustomUi": True, "strict": True}}},
+        {"setDataValidation": {"range": rng(1, 2, 1, 2), "rule": {"condition": {"type": "ONE_OF_RANGE",
+            "values": [{"userEnteredValue": "=" + ST + "!$I$1:$I$60"}]}, "showCustomUi": True, "strict": False}}},
+        {"setDataValidation": {"range": rng(2, 3, 1, 2), "rule": {"condition": {"type": "ONE_OF_RANGE",
+            "values": [{"userEnteredValue": "=" + ST + "!$J$1:$J$60"}]}, "showCustomUi": True, "strict": False}}},
+        {"repeatCell": {"range": rng(9, 11, 1, 2), "cell": {"userEnteredFormat": {"numberFormat":
+            {"type": "PERCENT", "pattern": "0%"}}}, "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {"range": rng(13, 44, 4, 5), "cell": {"userEnteredFormat": {"numberFormat":
+            {"type": "PERCENT", "pattern": "0%"}}}, "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {"range": rng(13, 44, 0, 1), "cell": {"userEnteredFormat": {"numberFormat":
+            {"type": "DATE", "pattern": "ddd dd/mm"}}}, "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {"range": rng(0, 3, 0, 1), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat.bold"}},
+        {"repeatCell": {"range": rng(4, 5, 0, 1), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat.bold"}},
+        {"repeatCell": {"range": rng(12, 13, 0, 5), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat.bold"}},
+        {"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "COLUMNS",
+            "startIndex": 12, "endIndex": 14}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
+        {"addChart": {"chart": {"spec": {"title": "Daily answer rate",
+            "basicChart": {"chartType": "LINE", "legendPosition": "NO_LEGEND",
+                "axis": [{"position": "BOTTOM_AXIS", "title": ""}, {"position": "LEFT_AXIS", "title": "Answer rate"}],
+                "domains": [{"domain": {"sourceRange": {"sources": [rng(13, 44, 0, 1)]}}}],
+                "series": [{"series": {"sourceRange": {"sources": [rng(13, 44, 4, 5)]}}, "targetAxis": "LEFT_AXIS"}],
+                "headerCount": 0}},
+            "position": {"overlayPosition": {"anchorCell": {"sheetId": gid, "rowIndex": 4, "columnIndex": 6},
+                                             "widthPixels": 620, "heightPixels": 320}}}}},
+    ]
+    svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": reqs}).execute()
+    st = _cbs_state(); st["dashboard_built"] = True; _cbs_save_state(st)
+    log.info("cb-dashboard: built %s" % CBS_DASH_TAB)
 
 
 def main():
