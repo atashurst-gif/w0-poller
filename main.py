@@ -1646,6 +1646,155 @@ def _cbs_sort_dt(r, now):
     return dt or now.replace(hour=23, minute=59, second=0, microsecond=0)
 
 
+# ─── DHD OOH second message (Dec's doc 26/09) ─────────────────────────────────
+# Every DHD lead gets its instant whatever the time. If the lead's FIRST reply
+# after the instant lands out of hours we send the second message:
+#   weekend  Fri 16:00 -> Sun 16:00                       -> dhd_weekend_second
+#   OOH      Sun 16:00 -> Mon 08:00, Mon-Thu 20:00 -> 08:00 -> dhd_ooh_second
+# Column G of the automation tab records the outcome so it can never double-send.
+DHD_SECOND_ENABLED     = os.getenv("DHD_SECOND_ENABLED", "1") == "1"
+DHD_SECOND_DRY_RUN     = os.getenv("DHD_SECOND_DRY_RUN", "1") == "1"
+DHD_SECOND_POLL_S      = int(os.getenv("DHD_SECOND_POLL_S", "120"))
+DHD_SECOND_WINDOW_H    = int(os.getenv("DHD_SECOND_WINDOW_H", "24"))      # how old an enquiry can be
+DHD_SECOND_REPLY_MAX_H = int(os.getenv("DHD_SECOND_REPLY_MAX_H", "6"))    # how old the reply can be
+DHD_SECOND_MAX         = int(os.getenv("DHD_SECOND_MAX", "80"))           # WATI lookups per pass
+DHD_SECOND_SHEET_ID    = os.getenv("DECLAN_AUTOMATION_SHEET_ID", "1FsEIcfd8eY3muNLbTd31qBEcT0irKYz5dNUAffaSoJA")
+DHD_SECOND_TABS        = ["DHD CT AUTOMATION", "DHD BAI AUTOMATION", "DHD UTI AUTOMATION"]
+_dhd_second_last = 0.0
+_dhd_second_svc  = None
+
+
+def dhd_second_template(dt):
+    """Template due for a reply at UK time dt, or None inside Dec's working hours."""
+    wd, h = dt.weekday(), dt.hour + dt.minute / 60.0
+    if (wd == 4 and h >= 16) or wd == 5 or (wd == 6 and h < 16):
+        return "dhd_weekend_second"
+    if wd == 6 or h < 8 or h >= 20:
+        return "dhd_ooh_second"
+    return None
+
+
+def _wati_created_uk(s):
+    try:
+        return datetime.datetime.fromisoformat(str(s)[:19]).replace(tzinfo=datetime.timezone.utc).astimezone(UK_TZ)
+    except Exception:
+        return None
+
+
+def _declan_messages(phone, n=40):
+    url = "%s/api/v1/getMessages/%s?pageSize=%d&pageNumber=1" % (WATI_API_URL_DECLAN, phone, n)
+    r = requests.get(url, headers={"Authorization": "Bearer " + WATI_TOKEN_DECLAN,
+                                   "accept": "application/json"}, timeout=20)
+    r.raise_for_status()
+    return ((r.json().get("messages") or {}).get("items")) or []
+
+
+def _dhd_first_reply(items, row_dt):
+    """Returns (instant_dt, first_reply_dt). The instant is the first outbound
+    message with a delivery status at/after the enquiry; the reply is the first
+    inbound after it (so the Meta 'I filled in your form' click never counts)."""
+    msgs = []
+    for m in items:
+        dt = _wati_created_uk(m.get("created"))
+        if dt:
+            msgs.append((dt, m))
+    msgs.sort(key=lambda x: x[0])
+    instant = None
+    for dt, m in msgs:
+        if m.get("owner") is not False and m.get("statusString") and dt >= row_dt - datetime.timedelta(minutes=10):
+            instant = dt
+            break
+    if not instant:
+        return None, None
+    for dt, m in msgs:
+        if m.get("owner") is False and dt > instant:
+            return instant, dt
+    return instant, None
+
+
+def dhd_second_pass():
+    global _dhd_second_last, _dhd_second_svc
+    if not DHD_SECOND_ENABLED or not WATI_API_URL_DECLAN:
+        return
+    if time.time() - _dhd_second_last < DHD_SECOND_POLL_S:
+        return
+    _dhd_second_last = time.time()
+    now = datetime.datetime.now(UK_TZ)
+    if dhd_second_template(now) is None:
+        return                                    # working hours: Dec's team is on it
+    if _dhd_second_svc is None:
+        _dhd_second_svc = get_sheets_service()
+    svc = _dhd_second_svc
+    try:
+        cb = svc.spreadsheets().values().get(spreadsheetId=DECLAN_CB_SHEET_ID,
+                                             range="'CALLBACKS'!D:D").execute().get("values", [])
+        booked = {"".join(ch for ch in str(r[0]) if ch.isdigit())[-9:] for r in cb if r and str(r[0]).strip()}
+    except Exception as e:
+        log.warning("dhd-2nd: CALLBACKS read failed (%s) - treating nobody as booked" % e)
+        booked = set()
+    cutoff = now - datetime.timedelta(hours=DHD_SECOND_WINDOW_H)
+    reply_cutoff = now - datetime.timedelta(hours=DHD_SECOND_REPLY_MAX_H)
+    checked = 0
+    for tab in DHD_SECOND_TABS:
+        try:
+            rows = svc.spreadsheets().values().get(spreadsheetId=DHD_SECOND_SHEET_ID,
+                                                   range="'%s'!A:G" % tab).execute().get("values", [])
+        except Exception as e:
+            log.warning("dhd-2nd: read %s failed: %s" % (tab, e))
+            continue
+        for i, r in enumerate(rows[1:], start=2):
+            if len(r) > 6 and str(r[6]).strip():
+                continue                                          # already handled
+            try:
+                row_dt = datetime.datetime.strptime(str(r[0])[:16], "%Y-%m-%d %H:%M").replace(tzinfo=UK_TZ)
+            except Exception:
+                continue
+            if row_dt < cutoff:
+                continue
+            status = (r[3] if len(r) > 3 else "").strip().lower()
+            if "contacted" in status:
+                continue
+            phone = format_phone(str(r[2])) if len(r) > 2 and str(r[2]).strip() else ""
+            if not phone or phone[-9:] in booked:
+                continue
+            if checked >= DHD_SECOND_MAX:
+                break
+            checked += 1
+            try:
+                instant, reply = _dhd_first_reply(_declan_messages(phone), row_dt)
+            except Exception as e:
+                log.warning("dhd-2nd: getMessages %s failed: %s" % (phone, e))
+                continue
+            if not instant or not reply:
+                continue                                          # nothing sent yet / no reply yet
+            raw_name = str(r[1]).strip() if len(r) > 1 else ""
+            name = raw_name.split()[0].title() if raw_name and "@" not in raw_name else "there"
+            tmpl = dhd_second_template(reply)
+            when = reply.strftime("%a %d/%m %H:%M")
+            if tmpl and reply < reply_cutoff:
+                mark = "stale " + reply.strftime("%d/%m %H:%M")
+                log.info("dhd-2nd: %s (%s) replied %s, older than %dh - skipped" % (phone, name, when, DHD_SECOND_REPLY_MAX_H))
+            elif DHD_SECOND_DRY_RUN:
+                log.info("dhd-2nd [DRY RUN] %s (%s) replied %s -> %s" % (phone, name, when, tmpl or "working hours, nothing"))
+                continue
+            elif tmpl is None:
+                mark = "wh " + reply.strftime("%d/%m %H:%M")
+                log.info("dhd-2nd: %s (%s) replied %s in working hours - no second message" % (phone, name, when))
+            else:
+                st = send_w0(phone, name, tmpl, api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+                if st == "retry":
+                    continue
+                mark = ("%s %s" % (tmpl, now.strftime("%d/%m %H:%M"))) if st == "ok" else "fail " + now.strftime("%d/%m %H:%M")
+                log.info("dhd-2nd: %s %s -> %s (%s) replied %s" % ("sent" if st == "ok" else "FAILED", tmpl, phone, name, when))
+            if DHD_SECOND_DRY_RUN:
+                continue
+            try:
+                svc.spreadsheets().values().update(spreadsheetId=DHD_SECOND_SHEET_ID, range="'%s'!G%d" % (tab, i),
+                                                   valueInputOption="RAW", body={"values": [[mark]]}).execute()
+            except Exception as e:
+                log.warning("dhd-2nd: mark %s row %d failed: %s" % (tab, i, e))
+
+
 def sync_cbs_today():
     if not CBS_TODAY_ENABLED:
         return
@@ -1909,6 +2058,10 @@ def main():
                 sync_cbs_today()
             except Exception as e:
                 log.error("cbs-today: %s" % e)
+            try:
+                dhd_second_pass()
+            except Exception as _e:
+                log.warning("dhd-2nd: pass failed: %s" % _e)
             for tab_cfg in WATCH_TABS:
                 fired = poll_tab(service, tab_cfg, seen)
                 total_fired += fired
