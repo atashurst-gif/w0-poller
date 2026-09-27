@@ -327,7 +327,7 @@ WATCH_TABS = [
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CT1",
      "template": "dhd_ct_instant", "lead_source": "dhd_ct",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD UTI1",
-     "template": "lg_dhd_w0", "lead_source": "dhd_utility",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
+     "template": "dhd_uti_instant", "lead_source": "dhd_utility",       "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD BAI1",
      "template": "dhd_bai_instant", "lead_source": "dhd_bailiff", "phone_col": 3, "name_col": 1, "skip_rows": 1, "full_name": True, "wati": "declan"},
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DC FORM1",
@@ -568,6 +568,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         DHD_SOURCE = {
             "council_tax_dhd_w0": "dhd_ct",
             "utility_w0": "dhd_utility",
+            "dhd_uti_instant": "dhd_utility",
             "bailiff_dhd_w0": "dhd_bailiff",
             "debt_collector_dhd_w0": "dhd_dc",
             "consolidation_dhd_w0": "dhd_consolidation",
@@ -582,7 +583,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         # Enrol DHD leads into Declan's nurture sequence (step 0 = W0 already sent).
         # Explicit whitelist: no default branch, so an unmapped source can
         # never fall through into the CT sequence (see Karen/Ismael 26/08).
-        DHD_SEQ_TAB = {"dhd_ct": "DHD CT AUTOMATION",
+        DHD_SEQ_TAB = {"dhd_ct": "DHD CT AUTOMATION", "dhd_utility": "DHD UTI AUTOMATION",
                        "dhd_bailiff": "DHD BAI AUTOMATION"}
         # Declan's non-DHD leads (UKDT CT + BST bailiff phoenix) enrol into his
         # own sequence tabs. Keyed off the same route_declan decision that chose
@@ -1239,7 +1240,7 @@ DHD_RETRY_WINDOW_HOURS = int(os.getenv("DHD_RETRY_WINDOW_HOURS", "6"))
 
 _DHD_TEMPLATE_FOR_SOURCE = {
     "dhd_ct": "dhd_ct_instant",
-    "dhd_utility": "lg_dhd_w0",
+    "dhd_utility": "dhd_uti_instant",
     "dhd_bailiff": "dhd_bai_instant",
     "dhd_dc": "lg_dhd_w0",
     "dhd_consolidation": "lg_dhd_w0",
