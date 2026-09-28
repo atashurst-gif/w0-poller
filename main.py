@@ -1950,6 +1950,20 @@ def ensure_cb_dashboard(svc):
         return
     ST = "'" + CBS_STATS_TAB + "'"
     gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_DASH_TAB)
+    if gid is not None:
+        # 28/09: trust the sheet, not the in-memory flag. If the tab already has a
+        # chart the dashboard is built - re-running piled up 3,000+ charts and
+        # reset the dropdowns every rebuild.
+        try:
+            meta = svc.spreadsheets().get(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                          fields="sheets(properties(sheetId),charts(chartId))").execute()
+            for sh in meta.get("sheets", []):
+                if sh["properties"]["sheetId"] == gid and sh.get("charts"):
+                    _cbs_state()["dashboard_built"] = True
+                    return
+        except Exception as e:
+            log.warning("cb-dashboard: chart check failed, skipping build: %s" % e)
+            return
     if gid is None:
         res = svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
             {"addSheet": {"properties": {"title": CBS_DASH_TAB}}}]}).execute()
