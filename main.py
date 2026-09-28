@@ -565,6 +565,11 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             declan_template = DHD_OOH_TEMPLATE
         status = send_w0(raw_phone, first_name, declan_template,
                          api_url=WATI_API_URL_DECLAN, token=WATI_TOKEN_DECLAN)
+        if status == "ok":
+            try:
+                tag_declan_conversation(raw_phone, declan_tag_for(tab_cfg, tab))
+            except Exception as _e:
+                log.warning("dec-tag: %s" % _e)
         DHD_SOURCE = {
             "council_tax_dhd_w0": "dhd_ct",
             "utility_w0": "dhd_utility",
@@ -1793,6 +1798,44 @@ def dhd_second_pass():
                                                    valueInputOption="RAW", body={"values": [[mark]]}).execute()
             except Exception as e:
                 log.warning("dhd-2nd: mark %s row %d failed: %s" % (tab, i, e))
+
+
+# ─── Dec's WATI tags: one tag per campaign = an inbox per campaign (28/09) ────
+# Tags must already exist in Dec's WATI (Settings > Tags and Attributes > Tags)
+# exactly as below; override with DECLAN_TAG_MAP_JSON. Fail-open.
+DECLAN_TAG_ENABLED = os.getenv("DECLAN_TAG_ENABLED", "1") == "1"
+DECLAN_TAG_MAP = {"dhd_ct": "DHD CT", "dhd_bailiff": "DHD BAI", "dhd_utility": "DHD UTI",
+                  "dhd_dc": "DHD DC", "dhd_consolidation": "DHD CON", "__ukdt_dec__": "UKDT DEC"}
+try:
+    DECLAN_TAG_MAP.update(json.loads(os.getenv("DECLAN_TAG_MAP_JSON", "{}")))
+except Exception:
+    pass
+
+
+def declan_tag_for(tab_cfg, tab):
+    src = tab_cfg.get("lead_source") or ""
+    if src in DECLAN_TAG_MAP:
+        return DECLAN_TAG_MAP[src]
+    if tab == "UKDTCTD1 (Dec)":
+        return DECLAN_TAG_MAP.get("__ukdt_dec__")
+    return None
+
+
+def tag_declan_conversation(raw_phone, tag):
+    """POST /api/ext/v3/conversations/{phone}/tags {tag_name}: idempotent, tag must exist."""
+    if not DECLAN_TAG_ENABLED or not tag or not WATI_API_URL_DECLAN:
+        return False
+    base = WATI_API_URL_DECLAN.rstrip("/").rsplit("/", 1)[0]      # v3 has no tenant id in the path
+    phone = format_phone(raw_phone)
+    r = requests.post(base + "/api/ext/v3/conversations/%s/tags" % phone,
+                      headers={"Authorization": "Bearer " + WATI_TOKEN_DECLAN,
+                               "Content-Type": "application/json", "accept": "application/json"},
+                      json={"tag_name": tag}, timeout=20)
+    if r.status_code == 200:
+        log.info("dec-tag: %s -> %s" % (phone, tag))
+        return True
+    log.warning("dec-tag: %s -> %s FAILED http %s %s" % (phone, tag, r.status_code, r.text[:120]))
+    return False
 
 
 def sync_cbs_today():
