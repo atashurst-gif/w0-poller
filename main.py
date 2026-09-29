@@ -1694,6 +1694,22 @@ def _declan_messages(phone, n=40):
     return ((r.json().get("messages") or {}).get("items")) or []
 
 
+_DHD_FORM_ECHO_RE = re.compile(os.getenv("DHD_SECOND_IGNORE_RE",
+    r"filled in your form|full name:|phone number:|am completat|formular"), re.I)
+_DHD_EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
+
+
+def _dhd_is_form_echo(text):
+    """Meta's 'Hello! I filled in your form...' click-to-WhatsApp message. It can
+    land AFTER the instant (lead taps 'message us' on the thank-you screen), so
+    it must never count as a reply. Language-proof fallback: email + phone in one
+    inbound message is a form echo, not a person typing."""
+    t = text or ""
+    if _DHD_FORM_ECHO_RE.search(t):
+        return True
+    return bool(_DHD_EMAIL_RE.search(t)) and bool(re.search(r"\d{9,}", t))
+
+
 def _dhd_first_reply(items, row_dt):
     """Returns (instant_dt, first_reply_dt). The instant is the first outbound
     message with a delivery status at/after the enquiry; the reply is the first
@@ -1712,7 +1728,7 @@ def _dhd_first_reply(items, row_dt):
     if not instant:
         return None, None
     for dt, m in msgs:
-        if m.get("owner") is False and dt > instant:
+        if m.get("owner") is False and dt > instant and not _dhd_is_form_echo(m.get("text")):
             return instant, dt
     return instant, None
 
