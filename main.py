@@ -2051,7 +2051,7 @@ def ensure_cb_dashboard(svc):
         r = 14 + i
         dcrit = "%s!A:A,$A%d,%s!B:B,$N$3,%s!C:C,$N$4" % (ST, r, ST, ST)
         daily.append([
-            "=IF($N$2-$N$1<%d,\"\",$N$2-%d)" % (i, i),
+            "=IF($N$1+%d>$N$2,\"\",$N$1+%d)" % (i, i),      # oldest first: Mon, Tue, Wed...
             "=IF($A%d=\"\",\"\",SUMIFS(%s!D:D,%s))" % (r, ST, dcrit),
             "=IF($A%d=\"\",\"\",SUMIFS(%s!E:E,%s))" % (r, ST, dcrit),
             "=IF($A%d=\"\",\"\",SUMIFS(%s!F:F,%s))" % (r, ST, dcrit),
