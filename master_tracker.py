@@ -35,11 +35,12 @@ SOURCES = [
     ("Bianca", BIANCA, "A:N", None),                      # first tab of Bianca's sheet
     (None,     ARKLE,  "'Leads Passed'!A:J", "lead gen"),  # Josh / DEX / ELI
 ]
+APPROVED_RNG = "'Approved'!A:M"                            # Arkle's MOC Approved list (Reference, Client, Source, LG, SFM, Stage, MOC Approval Date)
 
 HEAD = ["Date Passed", "Week", "Agent", "TL Ref", "Client Name", "Lead Source", "Contact Number", "Advisor",
         "Stage", "Type", "Outcome", "Agreed Date", "SIP Complete", "Prop Back", "MOC Set", "Approval Date", "Approved",
         "Partner", "Notes", "From"]                       # 20 columns: A..T   (Stage stays in column I)
-DATA_HEAD = ["Week", "Date", "Agent", "Type", "Agreed", "SIP", "MOC", "Approved", "DNQ", "TL Ref", "Client"]
+DATA_HEAD = ["Week", "Date", "Agent", "Type", "Agreed", "SIP", "MOC", "Approved", "DNQ", "TL Ref", "Client", "Legacy"]
 SNAP_HEAD = ["Agent", "IVA Passed", "DMP Passed", "IVA Agreed", "DMP Agreed", "SIP Complete", "MOC Set", "Approved",
              "DNQ", "IVA > Agreed", "Agreed > SIP", "IVA > Approved"]      # 12 columns: A..L
 NEWEST_FIRST = os.getenv("MT_NEWEST_FIRST", "1") == "1"
@@ -85,6 +86,48 @@ def date_order(values):
 
 def fdate(d):
     return d.strftime("%d/%m/%Y") if d else ""
+
+
+def norm_ref(r):
+    return re.sub(r"[^A-Z0-9]", "", str(r or "").upper())      # "TL- 1154497" -> "TL1154497"
+
+
+def load_approved(svc):
+    """Arkle's Approved tab -> {norm_ref: {"date": date|None, "row": {...}}}. Dates there
+    are often "28th April" with no year: rows are chronological, so the year is
+    carried forward and bumped when the month goes backwards."""
+    rows = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range=APPROVED_RNG).execute().get("values", [])
+    if not rows:
+        return {}
+    h = find_header(rows); hdr = rows[h]
+    c_ref = col(hdr, "reference", "ref"); c_name = col(hdr, "client name", "client"); c_src = col(hdr, "source")
+    c_lg = col(hdr, "lg", "lead gen"); c_sfm = col(hdr, "sfm", "advisor"); c_stage = col(hdr, "stage")
+    c_date = col(hdr, "moc approval date", "approval date", "approved", "date")
+    out = {}; year = 2025; prev = None
+    for r in rows[h + 1:]:
+        ref = norm_ref(cell(r, c_ref))
+        if not ref.startswith("TL"):
+            continue
+        raw = cell(r, c_date); d = pdate(raw)
+        if d is None and raw:
+            m = re.match(r"^\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)", raw)
+            if m:
+                for f in ("%d %B %Y", "%d %b %Y"):
+                    try:
+                        d = datetime.datetime.strptime("%s %s %d" % (m.group(1), m.group(2), year), f).date()
+                        break
+                    except ValueError:
+                        pass
+                if d and prev and d < prev - datetime.timedelta(days=60):
+                    year += 1; d = d.replace(year=year)
+                while d and d > datetime.date.today() + datetime.timedelta(days=30):   # never in the future
+                    year -= 1; d = d.replace(year=year)
+        if d:
+            prev = d; year = d.year
+        if ref not in out:
+            out[ref] = {"date": d, "name": cell(r, c_name), "source": cell(r, c_src), "agent": cell(r, c_lg),
+                        "advisor": cell(r, c_sfm), "stage": cell(r, c_stage) or "MOC Approved"}
+    return out
 
 
 def monday(d):
@@ -180,9 +223,39 @@ def build(svc):
             cases.extend(got)
         except Exception as e:
             log.warning("master-tracker: could not read %s (%s): %s" % (agent or rng, sid[:8], e))
+    # Arkle's Approved tab: stamp approvals onto tracker cases, add the rest as legacy rows
+    try:
+        approved = load_approved(svc)
+        log.info("master-tracker: Approved tab -> %d refs" % len(approved))
+    except Exception as e:
+        log.warning("master-tracker: could not read Approved tab: %s" % e); approved = {}
+    seen = set()
+    for c in cases:
+        c["legacy"] = False
+        a = approved.get(norm_ref(c["ref"]))
+        if a:
+            seen.add(norm_ref(c["ref"]))
+            c["apprflag"] = c["apprflag"] or "yes"
+            if not c["appr"] and a["date"]:
+                c["appr"] = fdate(a["date"])
+    tracker_agents = {c["agent"].lower(): c["agent"] for c in cases}
+    def legacy_agent(lg):
+        first = (lg or "").strip().split(" ")[0].lower()
+        return tracker_agents.get(first, "Pre-tracker")       # only credit names that exist in the trackers
+    for ref, a in approved.items():
+        if ref in seen or not a["date"]:
+            continue
+        cases.append({"date": a["date"], "agent": legacy_agent(a["agent"]),
+                      "ref": ref[:2] + "-" + ref[2:], "name": a["name"], "source": a["source"], "number": "",
+                      "advisor": a["advisor"], "stage": a["stage"], "outcome": "", "agreed": "", "sip": "", "prop": "",
+                      "moc": "", "appr": fdate(a["date"]), "apprflag": "yes", "partner": "Arkle",
+                      "notes": "From Approved tab - not in any tracker; date shown is the approval date", "from": "Approved tab",
+                      "legacy": True})
     cases.sort(key=lambda c: (c["date"], c["agent"], c["ref"]), reverse=NEWEST_FIRST)
     for c in cases:
         c["f"] = flags(c); c["type"] = "DMP" if c["f"]["dmp"] else "IVA"
+        if c["legacy"]:                            # counts as an approval that week, not as a new pass
+            c["f"].update({"agreed": False, "sip": False, "moc": False, "appr": True, "dnq": False})
 
     # MASTER TRACKER: a band above each week's cases
     master = [HEAD]
@@ -203,10 +276,10 @@ def build(svc):
     for c in cases:
         f = c["f"]
         data.append([monday(c["date"]).isoformat(), c["date"].isoformat(), c["agent"], c["type"],
-                     int(f["agreed"]), int(f["sip"]), int(f["moc"]), int(f["appr"]), int(f["dnq"]), c["ref"], c["name"]])
+                     int(f["agreed"]), int(f["sip"]), int(f["moc"]), int(f["appr"]), int(f["dnq"]), c["ref"], c["name"], int(c["legacy"])])
     weeks = sorted(by_week.keys(), reverse=True)
     weeklist = [["Week options", "Monday"], ["This week", ""], ["Last week", ""], ["All time", ""]] + \
-               [["W/C " + fdate(wk), wk.isoformat()] for wk in weeks]
+               [["W/C " + fdate(wk), wk.isoformat()] for wk in weeks[:30]]      # dropdown: last 30 weeks
     agents = sorted({c["agent"] for c in cases})
     return master, data, weeklist, agents, len(cases)
 
@@ -225,8 +298,8 @@ def snapshot_rows(agents, current_choice):
         first = start_row + 1
         for i, ag in enumerate(agents):
             r = first + i; a = "$A%d" % r
-            iva = '=COUNTIFS(%s)' % crit(week, a, ',%s!$D:$D,"IVA"' % D)
-            dmp = '=COUNTIFS(%s)' % crit(week, a, ',%s!$D:$D,"DMP"' % D)
+            iva = '=COUNTIFS(%s)' % crit(week, a, ',%s!$D:$D,"IVA",%s!$L:$L,0' % (D, D))
+            dmp = '=COUNTIFS(%s)' % crit(week, a, ',%s!$D:$D,"DMP",%s!$L:$L,0' % (D, D))
             iva_ag = '=COUNTIFS(%s)' % crit(week, a, ',%s!$D:$D,"IVA",%s!$E:$E,1' % (D, D))
             dmp_ag = '=COUNTIFS(%s)' % crit(week, a, ',%s!$D:$D,"DMP",%s!$E:$E,1' % (D, D))
             sip = '=COUNTIFS(%s)' % crit(week, a, ',%s!$F:$F,1' % D)
@@ -313,7 +386,7 @@ def ensure_formatting(svc):
     clears the tabs' colour rules and re-adds them, sets the dropdown, widths,
     hides MT DATA. Never runs on an ordinary refresh."""
     try:
-        v = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!W2" % MASTER_TAB).execute().get("values", [[""]])
+        v = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!X1" % MASTER_TAB).execute().get("values", [[""]])
         if v and v[0] and v[0][0] == FORMAT_VERSION:
             return
     except Exception:
@@ -354,7 +427,7 @@ def ensure_formatting(svc):
     dg, _ = info[DATA_TAB]
     reqs.append({"updateSheetProperties": {"properties": {"sheetId": dg, "hidden": True}, "fields": "hidden"}})
     svc.spreadsheets().batchUpdate(spreadsheetId=ARKLE, body={"requests": reqs}).execute()
-    svc.spreadsheets().values().update(spreadsheetId=ARKLE, range="'%s'!W2" % MASTER_TAB, valueInputOption="RAW", body={"values": [[FORMAT_VERSION]]}).execute()
+    svc.spreadsheets().values().update(spreadsheetId=ARKLE, range="'%s'!X1" % MASTER_TAB, valueInputOption="RAW", body={"values": [[FORMAT_VERSION]]}).execute()
     log.info("master-tracker: formatting %s applied (%d requests)" % (FORMAT_VERSION, len(reqs)))
 
 
@@ -452,7 +525,7 @@ if __name__ == "__main__":
     master, data, weeklist, agents, n = build(svc)
     print("cases:", n, "| agents:", agents, "| weeks:", len(weeklist) - 4)
     print("newest band:", master[1][0]); print("first case:", master[2])
-    print("types:", collections.Counter(r[3] for r in data[1:]))
+    print("types:", collections.Counter(r[3] for r in data[1:]), "| legacy approvals:", sum(r[11] for r in data[1:]), "| approved total:", sum(r[7] for r in data[1:]))
     if os.getenv("GO") != "1":
         print("preview only - GO=1 writes the tabs"); sys.exit()
     _last_hash = hashlib.md5(repr([master, data, weeklist, agents, FORMAT_VERSION]).encode()).hexdigest()
