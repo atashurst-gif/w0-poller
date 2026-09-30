@@ -313,7 +313,7 @@ def ensure_formatting(svc):
     clears the tabs' colour rules and re-adds them, sets the dropdown, widths,
     hides MT DATA. Never runs on an ordinary refresh."""
     try:
-        v = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!X1" % MASTER_TAB).execute().get("values", [[""]])
+        v = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!W2" % MASTER_TAB).execute().get("values", [[""]])
         if v and v[0] and v[0][0] == FORMAT_VERSION:
             return
     except Exception:
@@ -354,7 +354,7 @@ def ensure_formatting(svc):
     dg, _ = info[DATA_TAB]
     reqs.append({"updateSheetProperties": {"properties": {"sheetId": dg, "hidden": True}, "fields": "hidden"}})
     svc.spreadsheets().batchUpdate(spreadsheetId=ARKLE, body={"requests": reqs}).execute()
-    svc.spreadsheets().values().update(spreadsheetId=ARKLE, range="'%s'!X1" % MASTER_TAB, valueInputOption="RAW", body={"values": [[FORMAT_VERSION]]}).execute()
+    svc.spreadsheets().values().update(spreadsheetId=ARKLE, range="'%s'!W2" % MASTER_TAB, valueInputOption="RAW", body={"values": [[FORMAT_VERSION]]}).execute()
     log.info("master-tracker: formatting %s applied (%d requests)" % (FORMAT_VERSION, len(reqs)))
 
 
