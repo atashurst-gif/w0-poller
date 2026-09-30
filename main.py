@@ -2135,6 +2135,11 @@ def main():
                 dhd_second_pass()
             except Exception as _e:
                 log.warning("dhd-2nd: pass failed: %s" % _e)
+            try:
+                import master_tracker
+                master_tracker.tick(get_sheets_service)
+            except Exception as _e:
+                log.warning("master-tracker: %s" % _e)
             for tab_cfg in WATCH_TABS:
                 fired = poll_tab(service, tab_cfg, seen)
                 total_fired += fired
