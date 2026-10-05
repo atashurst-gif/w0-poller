@@ -1,69 +1,92 @@
 #!/usr/bin/env python3
-"""MASTER TRACKER + WEEKLY SNAPSHOT for the Arkle workbook.
+"""WEEKLY SNAPSHOT for the Arkle workbook, built from ONE shared tracker tab.
 
-Collects every case from Claire's and Bianca's Case Trackers and the workbook's
-own 'Leads Passed' tab (agent = Lead Gen column) and keeps three tabs current:
-  MASTER TRACKER   every case, newest week first, weekly bands, coloured Stage
+Everyone (Josh, Claire, Bianca, ...) logs cases on the same tab, 'MASTER TRACKER'
+(Josh's old 'Leads Passed' tab). This module only READS that tab - it never
+writes to it, formats it or clears it - and keeps two tabs current:
   MT DATA          one row per case as plain values (hidden) - the snapshot's source
-  WEEKLY SNAPSHOT  one table driven by a week dropdown (This week by default) +
-                   an all-time table underneath; light COUNTIFS over MT DATA
-Only rewrites when the data changed. No charts. Colour rules are versioned and
-applied once per version.
+  WEEKLY SNAPSHOT  per-person table driven by a week dropdown + an all-time table;
+                   people are split by the tracker's 'Lead Gen' column
+Arkle's 'Approved' tab stamps approvals onto tracker cases; approvals that are not
+on the tracker are counted too (row 'Pre-tracker' unless the Approved tab names a
+lead gen who is on the tracker) - MT_LEGACY=0 leaves those out.
+No other spreadsheet is read (the separate Claire / Bianca tracker files are
+disconnected).
+
+Safety
+  * all-or-nothing: the snapshot is rewritten only when the tracker AND the
+    Approved tab were both read in full. A timeout or any other read error leaves
+    the snapshot exactly as it was and the refresh is retried RETRY_S later.
+  * while the tab called 'MASTER TRACKER' is missing or is still the old generated
+    list, nothing is written at all ("waiting").
+  * every write goes through _ours(): only WEEKLY SNAPSHOT and MT DATA can be
+    written, whatever happens.
+  * the old MASTER_TRACKER_ENABLED / MASTER_TRACKER_DRY_RUN variables are ignored
+    on purpose (set MASTER_TRACKER_DRY_RUN=1 on Railway so an old build can never
+    write again). This build uses MT_ENABLED (default 1) and MT_DRY_RUN (default 0).
 
 Standalone (from ~/Desktop/w0-poller):
-  python3 master_tracker.py          # preview: counts + first rows, writes nothing
-  GO=1 python3 master_tracker.py     # build/refresh the two tabs now
+  python3 master_tracker.py          # preview: counts per person, writes nothing
+  GO=1 python3 master_tracker.py     # refresh WEEKLY SNAPSHOT + MT DATA now
 Inside the poller: master_tracker.tick(get_sheets_service) every MT_INTERVAL_S.
 """
 import os, sys, re, time, hashlib, datetime, logging, collections
 
+try:
+    from zoneinfo import ZoneInfo
+    UK = ZoneInfo("Europe/London")
+except Exception:                                   # pragma: no cover
+    UK = None
+
 log = logging.getLogger(__name__)
 
-ARKLE      = os.getenv("CBS_APPS2_SHEET_ID", "16qnJ842lFAo-4FVhloipJMFdCs7Spc2hFgoWnVGwVUs")
-CLAIRE     = os.getenv("MT_CLAIRE_SHEET_ID", "1sFBjBifnoLlDwN2kvAai-dDGrtLRtHx_pZjI55djM7o")
-BIANCA     = os.getenv("MT_BIANCA_SHEET_ID", "1spQ-JmLpr0GvrF87-JDSfK5KGpSLRDdWX-vVclLUDwk")
-MASTER_TAB = "MASTER TRACKER"
-SNAP_TAB   = "WEEKLY SNAPSHOT"
-DATA_TAB   = "MT DATA"
-ENABLED    = os.getenv("MASTER_TRACKER_ENABLED", "1") == "1"
-DRY_RUN    = os.getenv("MASTER_TRACKER_DRY_RUN", "1") == "1"
-INTERVAL_S = int(os.getenv("MT_INTERVAL_S", "900"))
+ARKLE       = os.getenv("CBS_APPS2_SHEET_ID", "16qnJ842lFAo-4FVhloipJMFdCs7Spc2hFgoWnVGwVUs")
+TRACKER_TAB = os.getenv("MT_TRACKER_TAB", "MASTER TRACKER")    # the shared tab people type into: READ ONLY
+SNAP_TAB    = "WEEKLY SNAPSHOT"
+DATA_TAB    = "MT DATA"
+APPROVED_RNG = "'Approved'!A:M"                                 # Arkle's MOC Approved list
+ENABLED     = os.getenv("MT_ENABLED", "1") == "1"
+DRY_RUN     = os.getenv("MT_DRY_RUN", "0") == "1"
+INTERVAL_S  = int(os.getenv("MT_INTERVAL_S", "900"))
+RETRY_S     = int(os.getenv("MT_RETRY_S", "120"))               # after a failed / waiting cycle
+LEGACY      = os.getenv("MT_LEGACY", "1") == "1"                # count Arkle approvals that aren't on the tracker
+NEWEST_FIRST = os.getenv("MT_NEWEST_FIRST", "1") == "1"
+CODE_VERSION = "src3"                                           # stamped in MT DATA!Q4 - one_tab.py checks it
+FORMAT_VERSION = "fmt5"                                         # bump to re-apply the snapshot layout once
+STATE_RNG   = "'%s'!P1:Q4" % DATA_TAB                           # updated / hash / format / code
+OURS        = (SNAP_TAB, DATA_TAB)                              # the only tabs this module may write
 
-# (agent label or None=take from a column, sheet id, range, agent column header)
-SOURCES = [
-    ("Claire", CLAIRE, "'Case Tracker'!A:N", None),
-    ("Bianca", BIANCA, "A:N", None),                      # first tab of Bianca's sheet
-    (None,     ARKLE,  "'Leads Passed'!A:J", "lead gen"),  # Josh / DEX / ELI
-]
-APPROVED_RNG = "'Approved'!A:M"                            # Arkle's MOC Approved list (Reference, Client, Source, LG, SFM, Stage, MOC Approval Date)
-
-HEAD = ["Date Passed", "Week", "Agent", "TL Ref", "Client Name", "Lead Source", "Contact Number", "Advisor",
-        "Stage", "Type", "Outcome", "Agreed Date", "SIP Complete", "Prop Back", "MOC Set", "Approval Date", "Approved",
-        "Partner", "Notes", "From"]                       # 20 columns: A..T   (Stage stays in column I)
 DATA_HEAD = ["Week", "Date", "Agent", "Type", "Agreed", "SIP", "MOC", "Approved", "DNQ", "TL Ref", "Client", "Legacy"]
 SNAP_HEAD = ["Agent", "IVA Passed", "DMP Passed", "IVA Agreed", "DMP Agreed", "SIP Complete", "MOC Set", "Approved",
              "DNQ", "IVA > Agreed", "Agreed > SIP", "IVA > Approved"]      # 12 columns: A..L
-NEWEST_FIRST = os.getenv("MT_NEWEST_FIRST", "1") == "1"
-FORMAT_VERSION = "fmt3"                                   # bump to re-apply colour rules once
+MAX_ROWS = 5000
 
 _last_tick = 0.0
 _last_hash = None
+_stamped = False
+
+
+class NotReady(Exception):
+    """The shared tracker tab isn't there (yet) - nothing may be written."""
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+def _now():
+    return datetime.datetime.now(UK) if UK else datetime.datetime.now()
+
+
 def _clean(s):
     s = str(s or "").strip()
     s = re.sub(r"^[A-Za-z]+\s+", "", s)           # "Tuesday 09/06/2026"
     return s.split(" ")[0]
 
 
-def pdate(s, order="dmy"):
+def pdate(s):
+    """Typed text -> date, day first (UK)."""
     s = _clean(s)
     if not s:
         return None
-    fmts = ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y", "%Y-%m-%d") if order == "dmy" \
-        else ("%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y", "%Y-%m-%d")
-    for f in fmts:
+    for f in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y", "%d.%m.%y", "%Y-%m-%d"):
         try:
             return datetime.datetime.strptime(s, f).date()
         except ValueError:
@@ -71,17 +94,50 @@ def pdate(s, order="dmy"):
     return None
 
 
-def date_order(values):
-    """Work out whether a sheet writes day-month or month-day: any first part > 12
-    means dmy, any second part > 12 means mdy, otherwise dmy (UK default)."""
-    firsts = seconds = 0
-    for v in values:
-        m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-]\d{2,4}$", _clean(v))
-        if not m:
-            continue
-        a, b = int(m.group(1)), int(m.group(2))
-        firsts += a > 12; seconds += b > 12
-    return "mdy" if seconds and not firsts else "dmy"
+EPOCH = datetime.date(1899, 12, 30)                 # Google Sheets day 0
+
+
+def is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def from_serial(n):
+    try:
+        d = EPOCH + datetime.timedelta(days=int(n))
+    except (OverflowError, ValueError):
+        return None
+    return d if 2015 <= d.year <= 2040 else None
+
+
+def to_date(v):
+    """A tracker date cell. Read unformatted, so a real date arrives as its serial
+    number and the way the cell is displayed never matters; typed text is read
+    day-first."""
+    if is_num(v):
+        return from_serial(v)
+    if isinstance(v, bool) or v is None:
+        return None
+    return pdate(v)
+
+
+def text(v):
+    """Any cell as text: whole numbers without '.0', ticked boxes as Yes."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "Yes" if v else ""
+    if is_num(v):
+        return str(int(v)) if float(v) == int(v) else str(v)
+    return str(v).strip()
+
+
+def date_text(v):
+    """A stage-date cell (Agreed Date, SIP Complete, MOC Set...): a real date as
+    dd/mm/yyyy, anything else as typed."""
+    if is_num(v):
+        d = from_serial(v)
+        return fdate(d) if d else text(v)
+    return text(v)
 
 
 def fdate(d):
@@ -90,44 +146,6 @@ def fdate(d):
 
 def norm_ref(r):
     return re.sub(r"[^A-Z0-9]", "", str(r or "").upper())      # "TL- 1154497" -> "TL1154497"
-
-
-def load_approved(svc):
-    """Arkle's Approved tab -> {norm_ref: {"date": date|None, "row": {...}}}. Dates there
-    are often "28th April" with no year: rows are chronological, so the year is
-    carried forward and bumped when the month goes backwards."""
-    rows = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range=APPROVED_RNG).execute().get("values", [])
-    if not rows:
-        return {}
-    h = find_header(rows); hdr = rows[h]
-    c_ref = col(hdr, "reference", "ref"); c_name = col(hdr, "client name", "client"); c_src = col(hdr, "source")
-    c_lg = col(hdr, "lg", "lead gen"); c_sfm = col(hdr, "sfm", "advisor"); c_stage = col(hdr, "stage")
-    c_date = col(hdr, "moc approval date", "approval date", "approved", "date")
-    out = {}; year = 2025; prev = None
-    for r in rows[h + 1:]:
-        ref = norm_ref(cell(r, c_ref))
-        if not ref.startswith("TL"):
-            continue
-        raw = cell(r, c_date); d = pdate(raw)
-        if d is None and raw:
-            m = re.match(r"^\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)", raw)
-            if m:
-                for f in ("%d %B %Y", "%d %b %Y"):
-                    try:
-                        d = datetime.datetime.strptime("%s %s %d" % (m.group(1), m.group(2), year), f).date()
-                        break
-                    except ValueError:
-                        pass
-                if d and prev and d < prev - datetime.timedelta(days=60):
-                    year += 1; d = d.replace(year=year)
-                while d and d > datetime.date.today() + datetime.timedelta(days=30):   # never in the future
-                    year -= 1; d = d.replace(year=year)
-        if d:
-            prev = d; year = d.year
-        if ref not in out:
-            out[ref] = {"date": d, "name": cell(r, c_name), "source": cell(r, c_src), "agent": cell(r, c_lg),
-                        "advisor": cell(r, c_sfm), "stage": cell(r, c_stage) or "MOC Approved"}
-    return out
 
 
 def monday(d):
@@ -156,40 +174,115 @@ def col(hdr, *names):
     return None
 
 
+def raw(r, i):
+    return r[i] if i is not None and i < len(r) else None
+
+
 def cell(r, i):
-    return str(r[i]).strip() if i is not None and i < len(r) and r[i] is not None else ""
+    return text(raw(r, i))
 
 
-def load_source(svc, agent, sid, rng, agent_col):
-    rows = svc.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
+def _ours(rng):
+    """Every write passes through here: only our two tabs can ever be written."""
+    tab = rng.split("!")[0].strip("'")
+    if tab not in OURS:
+        raise RuntimeError("refusing to write to '%s' - this module only writes %s" % (tab, " and ".join(OURS)))
+    return rng
+
+
+# ── reading ────────────────────────────────────────────────────────────────────
+def _props(svc):
+    meta = svc.spreadsheets().get(spreadsheetId=ARKLE,
+                                  fields="sheets(properties(title,sheetId,hidden,gridProperties(rowCount,columnCount)))").execute()
+    return [sh["properties"] for sh in meta.get("sheets", [])]
+
+
+def is_generated(rows):
+    """True for the list this module used to build (Date Passed / Week / Agent ... From)."""
+    hdr = [str(c).strip().lower() for c in (rows[0] if rows else [])]
+    return "week" in hdr and "agent" in hdr and "from" in hdr
+
+
+def read_tracker(svc):
+    """All rows of the shared tracker tab (unformatted). NotReady while the tab is
+    missing or is still the old generated list."""
+    titles = {p["title"].strip().lower(): p["title"] for p in _props(svc)}
+    real = titles.get(TRACKER_TAB.strip().lower())
+    if not real:
+        raise NotReady("no '%s' tab in the workbook yet" % TRACKER_TAB)
+    rows = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'" % real.replace("'", "''"),
+                                           valueRenderOption="UNFORMATTED_VALUE",
+                                           dateTimeRenderOption="SERIAL_NUMBER").execute().get("values", [])
+    if is_generated(rows):
+        raise NotReady("'%s' is still the old generated list (one_tab.py not run yet)" % real)
+    return rows, real
+
+
+def parse_tracker(rows, title):
+    """Shared-tab rows -> cases. Week divider rows ('WC 05/10') and anything else
+    without a date are skipped. The person comes from the Lead Gen column."""
     if not rows:
         return []
     h = find_header(rows); hdr = rows[h]
     c_date = col(hdr, "date"); c_ref = col(hdr, "crm reference", "tl ref", "reference", "ref")
-    c_name = col(hdr, "client name", "client", "name"); c_src = col(hdr, "lead source", "source", "campaign")
-    c_num = col(hdr, "contact number", "number", "phone"); c_adv = col(hdr, "advisor", "sfm")
-    c_stage = col(hdr, "status", "stage"); c_agreed = col(hdr, "agreed date", "agreed")
-    c_sip = col(hdr, "sip complete", "sip"); c_moc = col(hdr, "moc set", "moc")
-    c_appr = col(hdr, "approval date", "approval"); c_apprflag = col(hdr, "approved")
-    c_out = col(hdr, "outcome"); c_prop = col(hdr, "prop back", "prop"); c_part = col(hdr, "partner")
-    c_notes = col(hdr, "notes"); c_agent = col(hdr, agent_col) if agent_col else None
-    label = agent or rng.split("!")[0].strip("'")
-    order = date_order(cell(r, c_date) for r in rows[h + 1:])
+    c_name = col(hdr, "client name", "client", "name"); c_agent = col(hdr, "lead gen", "agent")
+    c_adv = col(hdr, "advisor", "sfm"); c_stage = col(hdr, "status", "stage")
+    c_agreed = col(hdr, "agreed date", "agreed"); c_sip = col(hdr, "sip complete", "sip")
+    c_moc = col(hdr, "moc set", "moc"); c_appr = col(hdr, "approval date", "approval")
+    c_apprflag = col(hdr, "approved"); c_out = col(hdr, "outcome")
+    missing = [n for n, c in (("Date", c_date), ("TL Ref", c_ref), ("Client name", c_name), ("Lead Gen", c_agent), ("Stage", c_stage)) if c is None]
+    if missing:
+        raise RuntimeError("'%s' header row has no %s column - not refreshing" % (title, " / ".join(missing)))
     out = []
     for r in rows[h + 1:]:
-        if not any(str(c).strip() for c in r):
-            continue
-        d = pdate(cell(r, c_date), order)
+        d = to_date(raw(r, c_date))
         ref = cell(r, c_ref); name = cell(r, c_name)
-        if not d or not (ref or name):            # skips "WC 24/08" divider rows and date-only rows
+        if not d or not (ref or name):            # week dividers, blank rows, date-only rows
             continue
-        ag = agent or (cell(r, c_agent).strip().title() if c_agent is not None and cell(r, c_agent) else "Unassigned")
+        lg = " ".join(cell(r, c_agent).split())
         out.append({
-            "date": d, "agent": ag, "ref": ref, "name": name, "source": cell(r, c_src), "number": cell(r, c_num),
-            "advisor": cell(r, c_adv), "stage": cell(r, c_stage), "outcome": cell(r, c_out), "agreed": cell(r, c_agreed),
-            "sip": cell(r, c_sip), "prop": cell(r, c_prop), "moc": cell(r, c_moc), "appr": cell(r, c_appr),
-            "apprflag": cell(r, c_apprflag), "partner": cell(r, c_part), "notes": cell(r, c_notes), "from": label,
+            "date": d, "agent": lg.title() if lg else "Unassigned", "ref": ref, "name": name,
+            "advisor": cell(r, c_adv), "stage": cell(r, c_stage), "outcome": cell(r, c_out),
+            "agreed": date_text(raw(r, c_agreed)), "sip": date_text(raw(r, c_sip)), "moc": date_text(raw(r, c_moc)),
+            "appr": date_text(raw(r, c_appr)), "apprflag": date_text(raw(r, c_apprflag)), "legacy": False,
         })
+    return out
+
+
+def load_approved(svc):
+    """Arkle's Approved tab -> {norm_ref: {...}}. Dates there are often "28th April"
+    with no year: rows are chronological, so the year is carried forward and bumped
+    when the month goes backwards. Raises on a read error (the caller then leaves
+    the snapshot alone)."""
+    rows = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range=APPROVED_RNG).execute().get("values", [])
+    if not rows:
+        return {}
+    h = find_header(rows); hdr = rows[h]
+    c_ref = col(hdr, "reference", "ref"); c_name = col(hdr, "client name", "client")
+    c_lg = col(hdr, "lg", "lead gen"); c_date = col(hdr, "moc approval date", "approval date", "approved", "date")
+    out = {}; year = 2025; prev = None
+    for r in rows[h + 1:]:
+        ref = norm_ref(cell(r, c_ref))
+        if not ref.startswith("TL"):
+            continue
+        rawd = cell(r, c_date); d = pdate(rawd)
+        if d is None and rawd:
+            m = re.match(r"^\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)", rawd)
+            if m:
+                for f in ("%d %B %Y", "%d %b %Y"):
+                    try:
+                        d = datetime.datetime.strptime("%s %s %d" % (m.group(1), m.group(2), year), f).date()
+                        break
+                    except ValueError:
+                        pass
+                if d and prev and d < prev - datetime.timedelta(days=60):
+                    year += 1; d = d.replace(year=year)
+                while d and d > datetime.date.today() + datetime.timedelta(days=30):   # never in the future
+                    year -= 1; d = d.replace(year=year)
+        if d:
+            prev = d; year = d.year
+        if ref not in out:
+            out[ref] = {"date": d, "name": cell(r, c_name), "agent": cell(r, c_lg)}
     return out
 
 
@@ -198,8 +291,6 @@ def flags(c):
     'agreed' (Agreed DMP) but never count in the IVA stages."""
     t = (c["stage"] or "").lower()
     def yes(v):
-        """A stage column counts only if it holds a date or an explicit yes -
-        Claire's tracker keeps product codes (MW / DMP / N/A) in those cells."""
         v = (v or "").strip().lower()
         return bool(pdate(v)) or v in ("yes", "y", "done", "complete", "completed", "true", "✓")
     dmp = "dmp" in t or "dmp" in (c["outcome"] or "").lower() or "dmp" in (c["advisor"] or "").lower()
@@ -215,73 +306,61 @@ def flags(c):
 
 # ── build ──────────────────────────────────────────────────────────────────────
 def build(svc):
-    cases = []
-    for agent, sid, rng, agent_col in SOURCES:
-        try:
-            got = load_source(svc, agent, sid, rng, agent_col)
-            log.info("master-tracker: %s -> %d cases" % (agent or rng, len(got)))
-            cases.extend(got)
-        except Exception as e:
-            log.warning("master-tracker: could not read %s (%s): %s" % (agent or rng, sid[:8], e))
-    # Arkle's Approved tab: stamp approvals onto tracker cases, add the rest as legacy rows
-    try:
-        approved = load_approved(svc)
-        log.info("master-tracker: Approved tab -> %d refs" % len(approved))
-    except Exception as e:
-        log.warning("master-tracker: could not read Approved tab: %s" % e); approved = {}
+    """Reads everything, returns (data, weeklist, agents, info). Raises if any read
+    fails - the caller then writes nothing."""
+    rows, title = read_tracker(svc)
+    cases = parse_tracker(rows, title)
+    on_tracker = len(cases)
+    approved = load_approved(svc)
     seen = set()
     for c in cases:
-        c["legacy"] = False
         a = approved.get(norm_ref(c["ref"]))
         if a:
             seen.add(norm_ref(c["ref"]))
             c["apprflag"] = c["apprflag"] or "yes"
             if not c["appr"] and a["date"]:
                 c["appr"] = fdate(a["date"])
-    tracker_agents = {c["agent"].lower(): c["agent"] for c in cases}
-    def legacy_agent(lg):
-        first = (lg or "").strip().split(" ")[0].lower()
-        return tracker_agents.get(first, "Pre-tracker")       # only credit names that exist in the trackers
-    for ref, a in approved.items():
-        if ref in seen or not a["date"]:
-            continue
-        cases.append({"date": a["date"], "agent": legacy_agent(a["agent"]),
-                      "ref": ref[:2] + "-" + ref[2:], "name": a["name"], "source": a["source"], "number": "",
-                      "advisor": a["advisor"], "stage": a["stage"], "outcome": "", "agreed": "", "sip": "", "prop": "",
-                      "moc": "", "appr": fdate(a["date"]), "apprflag": "yes", "partner": "Arkle",
-                      "notes": "From Approved tab - not in any tracker; date shown is the approval date", "from": "Approved tab",
-                      "legacy": True})
+    if LEGACY:
+        people = {c["agent"].lower(): c["agent"] for c in cases}
+        for ref, a in approved.items():
+            if ref in seen or not a["date"]:
+                continue
+            first = (a["agent"] or "").strip().split(" ")[0].lower()
+            cases.append({"date": a["date"], "agent": people.get(first, "Pre-tracker"), "ref": ref[:2] + "-" + ref[2:],
+                          "name": a["name"], "advisor": "", "stage": "MOC Approved", "outcome": "", "agreed": "",
+                          "sip": "", "moc": "", "appr": fdate(a["date"]), "apprflag": "yes", "legacy": True})
     cases.sort(key=lambda c: (c["date"], c["agent"], c["ref"]), reverse=NEWEST_FIRST)
     for c in cases:
         c["f"] = flags(c); c["type"] = "DMP" if c["f"]["dmp"] else "IVA"
-        if c["legacy"]:                            # counts as an approval that week, not as a new pass
+        if c["legacy"]:                            # an approval that week, not a new pass
             c["f"].update({"agreed": False, "sip": False, "moc": False, "appr": True, "dnq": False})
-
-    # MASTER TRACKER: a band above each week's cases
-    master = [HEAD]
-    by_week = collections.OrderedDict()
-    for c in cases:
-        by_week.setdefault(monday(c["date"]), []).append(c)
-    for wk, group in by_week.items():
-        sun = wk + datetime.timedelta(days=6)
-        master.append(["W/C %s   (%s - %s)   %d case%s" % (fdate(wk), wk.strftime("%d %b"), sun.strftime("%d %b"),
-                                                          len(group), "" if len(group) == 1 else "s")] + [""] * (len(HEAD) - 1))
-        for c in group:
-            master.append([fdate(c["date"]), "w/c " + fdate(wk), c["agent"], c["ref"], c["name"], c["source"],
-                           c["number"], c["advisor"], c["stage"], c["type"], c["outcome"], c["agreed"], c["sip"], c["prop"],
-                           c["moc"], c["appr"], c["apprflag"], c["partner"], c["notes"], c["from"]])
-
-    # MT DATA: one row per case, ISO dates so the sheet stores real dates
     data = [DATA_HEAD]
-    for c in cases:
+    for c in cases:                                # ISO dates so the sheet stores real dates
         f = c["f"]
         data.append([monday(c["date"]).isoformat(), c["date"].isoformat(), c["agent"], c["type"],
                      int(f["agreed"]), int(f["sip"]), int(f["moc"]), int(f["appr"]), int(f["dnq"]), c["ref"], c["name"], int(c["legacy"])])
-    weeks = sorted(by_week.keys(), reverse=True)
+    weeks = sorted({monday(c["date"]) for c in cases}, reverse=True)
     weeklist = [["Week options", "Monday"], ["This week", ""], ["Last week", ""], ["All time", ""]] + \
                [["W/C " + fdate(wk), wk.isoformat()] for wk in weeks[:30]]      # dropdown: last 30 weeks
     agents = sorted({c["agent"] for c in cases})
-    return master, data, weeklist, agents, len(cases)
+    info = {"tab": title, "on_tracker": on_tracker, "legacy": len(cases) - on_tracker, "approved_refs": len(approved),
+            "people": dict(collections.Counter(c["agent"] for c in cases if not c["legacy"]))}
+    return data, weeklist, agents, info
+
+
+def counts(data, start, end):
+    """The snapshot's numbers for one date window, worked out here (same rules as
+    the sheet's COUNTIFS) - used by the preview."""
+    out = collections.OrderedDict()
+    for r in data[1:]:
+        d = datetime.date.fromisoformat(r[1])
+        if not (start <= d <= end):
+            continue
+        a = out.setdefault(r[2], [0] * 8)
+        a[0] += r[3] == "IVA" and not r[11]; a[1] += r[3] == "DMP" and not r[11]
+        a[2] += r[3] == "IVA" and r[4]; a[3] += r[3] == "DMP" and r[4]
+        a[4] += r[5]; a[5] += r[6]; a[6] += r[7]; a[7] += r[8]
+    return collections.OrderedDict(sorted(out.items()))
 
 
 def snapshot_rows(agents, current_choice):
@@ -309,7 +388,7 @@ def snapshot_rows(agents, current_choice):
             rows.append([ag, iva, dmp, iva_ag, dmp_ag, sip, moc, apr, dnq,
                          '=IF(B%d=0,"",D%d/B%d)' % (r, r, r), '=IF(D%d=0,"",F%d/D%d)' % (r, r, r), '=IF(B%d=0,"",H%d/B%d)' % (r, r, r)])
         last = first + len(agents) - 1; t = last + 1
-        tot = ["TOTAL"] + ["=SUM(%s%d:%s%d)" % (col, first, col, last) for col in "BCDEFGHI"]
+        tot = ["TOTAL"] + ["=SUM(%s%d:%s%d)" % (cl, first, cl, last) for cl in "BCDEFGHI"]
         tot += ['=IF(B%d=0,"",D%d/B%d)' % (t, t, t), '=IF(D%d=0,"",F%d/D%d)' % (t, t, t), '=IF(B%d=0,"",H%d/B%d)' % (t, t, t)]
         rows.append(tot)
         return rows
@@ -318,37 +397,16 @@ def snapshot_rows(agents, current_choice):
     end = '=IF($B$1="All time",TODAY()+7,$N$1+6)'
     rows = [["WEEK", current_choice or "This week", "", '="Showing "&TEXT($N$1,"ddd dd/mm")&" to "&TEXT($N$2,"ddd dd/mm")'],
             [""] * len(SNAP_HEAD)]
-    rows += table_rows(3, week=True)                      # header on row 3, agents from row 4
+    rows += table_rows(3, week=True)                      # header on row 3, people from row 4
     n = len(agents)
-    rows += [[""] * len(SNAP_HEAD), ["ALL WEEKS  -  every case since the trackers began"] + [""] * (len(SNAP_HEAD) - 1)]
+    rows += [[""] * len(SNAP_HEAD), ["ALL WEEKS  -  every case on the MASTER TRACKER"] + [""] * (len(SNAP_HEAD) - 1)]
     rows += table_rows(len(rows) + 1, week=False)
-    # 1-based (header row, TOTAL row) of each table: week table header 3, agents 4.., TOTAL n+4;
-    # blank n+5, ALL WEEKS title n+6, header n+7, agents.., TOTAL 2n+8
+    # 1-based (header row, TOTAL row) of each table: week table header 3, people 4.., TOTAL n+4;
+    # blank n+5, ALL WEEKS title n+6, header n+7, people.., TOTAL 2n+8
     return rows, {"N1": start, "N2": end, "week_rows": (3, n + 4), "all_rows": (n + 7, 2 * n + 8)}
 
 
-# ── sheet writing ──────────────────────────────────────────────────────────────
-MAX_ROWS = 5000
-ALLOWED_TABS = {MASTER_TAB, SNAP_TAB, DATA_TAB}
-
-
-def _meta(svc):
-    return svc.spreadsheets().get(spreadsheetId=ARKLE, fields="sheets(properties(title,sheetId,hidden),conditionalFormats)").execute()
-
-
-def _gids(svc):
-    return {sh["properties"]["title"]: sh["properties"]["sheetId"] for sh in _meta(svc)["sheets"]}
-
-
-def ensure_tabs(svc):
-    gids = _gids(svc)
-    for title, ncols in ((MASTER_TAB, len(HEAD)), (SNAP_TAB, 16), (DATA_TAB, 16)):
-        if title not in gids:
-            svc.spreadsheets().batchUpdate(spreadsheetId=ARKLE, body={"requests": [
-                {"addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": 2000, "columnCount": ncols + 4}}}}]}).execute()
-            log.info("master-tracker: created tab %s" % title)
-
-
+# ── sheet writing (WEEKLY SNAPSHOT and MT DATA only) ───────────────────────────
 def _rgb(hexs):
     return {"red": int(hexs[1:3], 16) / 255, "green": int(hexs[3:5], 16) / 255, "blue": int(hexs[5:7], 16) / 255}
 
@@ -357,63 +415,57 @@ def _fmt(bg, fg="#000000", bold=False):
     return {"backgroundColor": _rgb(bg), "textFormat": {"foregroundColor": _rgb(fg), "bold": bold}}
 
 
-def _rule(gid, rng, cond, fmt):
-    return {"addConditionalFormatRule": {"index": 0, "rule": {"ranges": [dict(sheetId=gid, **rng)], "booleanRule": {"condition": cond, "format": fmt}}}}
-
-
 def _cell(gid, r0, r1, c0, c1, fmt, fields):
     return {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1},
                            "cell": {"userEnteredFormat": fmt}, "fields": fields}}
 
 
 NAVY, NAVY_LIGHT, ROW_ALT, YELLOW_CELL, TEAL = "#1F4E79", "#D9E2F3", "#F3F7FB", "#FFF2CC", "#0B6E4F"
-# colours matching the Status dropdown chips (guide from Aaron 30/09)
-BLUE, GREYBLUE, GREEN, PURPLE, YELLOW, RED, DARKRED = "#BFE1F6", "#C6DBE1", "#D4EDBC", "#E6CFF2", "#FFE5A0", "#E23A5A", "#B10202"
-STAGE_COLOURS = [   # lowest priority first (rules are inserted at index 0, so the last one here wins ties)
-    ("in pods", BLUE, "#0842A0"), ("lead passed", BLUE, "#0842A0"), ("callback", BLUE, "#0842A0"), ("agreed", BLUE, "#0842A0"),
-    ("sip", BLUE, "#0842A0"), ("moc set", BLUE, "#0842A0"), ("prop back", BLUE, "#0842A0"),
-    ("prop out", GREYBLUE, "#215A6C"),
-    ("refresh", PURPLE, "#5A3286"), ("sched", PURPLE, "#5A3286"), ("awaiting", PURPLE, "#5A3286"), ("on hold", PURPLE, "#5A3286"),
-    ("dnq", DARKRED, "#FFFFFF"), ("money wellness", DARKRED, "#FFFFFF"), ("already in iva", DARKRED, "#FFFFFF"),
-    ("dnc", RED, "#000000"),
-    ("lost contact", YELLOW, "#473821"),
-    ("agreed dmp", GREEN, "#11734B"), ("approved", GREEN, "#11734B"),
-]
+
+
+def ensure_tabs(svc, need_rows=0):
+    """Our two tabs exist and are big enough (state lives in MT DATA!P:Q)."""
+    props = {p["title"]: p for p in _props(svc)}
+    reqs = []
+    for title in OURS:
+        p = props.get(title)
+        if p is None:
+            reqs.append({"addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": 2000, "columnCount": 20}}}})
+            continue
+        g = p.get("gridProperties", {})
+        if g.get("columnCount", 0) < 18:
+            reqs.append({"appendDimension": {"sheetId": p["sheetId"], "dimension": "COLUMNS", "length": 20 - g.get("columnCount", 0)}})
+        if title == DATA_TAB and g.get("rowCount", 0) < need_rows + 50:
+            reqs.append({"appendDimension": {"sheetId": p["sheetId"], "dimension": "ROWS", "length": need_rows + 500 - g.get("rowCount", 0)}})
+    if reqs:
+        svc.spreadsheets().batchUpdate(spreadsheetId=ARKLE, body={"requests": reqs}).execute()
+        log.info("master-tracker: prepared tabs (%d change%s)" % (len(reqs), "" if len(reqs) == 1 else "s"))
+
+
+def read_state(svc):
+    """{'updated','hash','format','code'} from MT DATA!P1:Q4 ({} if not there yet)."""
+    try:
+        vals = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range=STATE_RNG).execute().get("values", [])
+    except Exception:
+        return {}
+    return {str(r[0]).strip(): str(r[1]).strip() for r in vals if len(r) > 1}
+
+
+def write_state(svc, **kv):
+    st = read_state(svc); st.update(kv)
+    svc.spreadsheets().values().update(spreadsheetId=ARKLE, range=_ours(STATE_RNG), valueInputOption="RAW", body={"values": [
+        ["updated", st.get("updated", "")], ["hash", st.get("hash", "")], ["format", st.get("format", "")], ["code", st.get("code", "")]]}).execute()
 
 
 def ensure_formatting(svc):
-    """Versioned one-off. Runs only when MASTER TRACKER!X1 != FORMAT_VERSION:
-    clears the tabs' colour rules and re-adds them, sets the dropdown, widths,
-    hides MT DATA. Never runs on an ordinary refresh."""
-    try:
-        v = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!W2" % MASTER_TAB).execute().get("values", [[""]])
-        if v and v[0] and v[0][0] == FORMAT_VERSION:
-            return
-    except Exception:
-        pass
-    meta = _meta(svc)
+    """Versioned one-off for the snapshot tab: dropdown, widths, gridlines; hides
+    MT DATA. Never runs on an ordinary refresh and never touches the tracker tab."""
+    if read_state(svc).get("format") == FORMAT_VERSION:
+        return
+    meta = svc.spreadsheets().get(spreadsheetId=ARKLE, fields="sheets(properties(title,sheetId),conditionalFormats)").execute()
     info = {sh["properties"]["title"]: (sh["properties"]["sheetId"], len(sh.get("conditionalFormats", []))) for sh in meta["sheets"]}
-    reqs = []
-    for title in (MASTER_TAB, SNAP_TAB):
-        gid, n = info[title]
-        for _ in range(n):
-            reqs.append({"deleteConditionalFormatRule": {"sheetId": gid, "index": 0}})
-    mg, _ = info[MASTER_TAB]
-    stage = {"startRowIndex": 1, "startColumnIndex": 8, "endColumnIndex": 9}                 # column I = Stage
-    for word, bg, fg in STAGE_COLOURS:
-        reqs.append(_rule(mg, stage, {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": word}]}, _fmt(bg, fg)))
-    # DMP rows get a soft tint everywhere except the Stage cell, so the stage colour still shows
-    reqs.append({"addConditionalFormatRule": {"index": 0, "rule": {
-        "ranges": [{"sheetId": mg, "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 8},
-                   {"sheetId": mg, "startRowIndex": 1, "startColumnIndex": 9, "endColumnIndex": len(HEAD)}],
-        "booleanRule": {"condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": '=$J2="DMP"'}]},
-                        "format": {"backgroundColor": _rgb("#FBF3E6")}}}}})
-    band = {"startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(HEAD)}
-    reqs.append(_rule(mg, band, {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": '=LEFT($A2,4)="W/C "'}]}, _fmt(NAVY, "#FFFFFF", True)))
-    reqs.append(_cell(mg, 0, 1, 0, len(HEAD), _fmt(NAVY_LIGHT, "#1F4E79", True), "userEnteredFormat(backgroundColor,textFormat)"))
-    reqs.append({"updateSheetProperties": {"properties": {"sheetId": mg, "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}})
-    reqs.append({"autoResizeDimensions": {"dimensions": {"sheetId": mg, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(HEAD)}}})
-    sg, _ = info[SNAP_TAB]
+    sg, n = info[SNAP_TAB]; dg, _ = info[DATA_TAB]
+    reqs = [{"deleteConditionalFormatRule": {"sheetId": sg, "index": 0}} for _ in range(n)]
     reqs.append({"setDataValidation": {"range": {"sheetId": sg, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 1, "endColumnIndex": 2},
                                        "rule": {"condition": {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": "='%s'!$M$2:$M$300" % DATA_TAB}]},
                                                 "showCustomUi": True, "strict": False}}})
@@ -424,11 +476,10 @@ def ensure_formatting(svc):
     reqs.append({"updateDimensionProperties": {"range": {"sheetId": sg, "dimension": "COLUMNS", "startIndex": 12, "endIndex": 14},
                                                "properties": {"pixelSize": 60}, "fields": "pixelSize"}})
     reqs.append({"updateSheetProperties": {"properties": {"sheetId": sg, "gridProperties": {"frozenRowCount": 0, "hideGridlines": True}}, "fields": "gridProperties(frozenRowCount,hideGridlines)"}})
-    dg, _ = info[DATA_TAB]
     reqs.append({"updateSheetProperties": {"properties": {"sheetId": dg, "hidden": True}, "fields": "hidden"}})
     svc.spreadsheets().batchUpdate(spreadsheetId=ARKLE, body={"requests": reqs}).execute()
-    svc.spreadsheets().values().update(spreadsheetId=ARKLE, range="'%s'!W2" % MASTER_TAB, valueInputOption="RAW", body={"values": [[FORMAT_VERSION]]}).execute()
-    log.info("master-tracker: formatting %s applied (%d requests)" % (FORMAT_VERSION, len(reqs)))
+    write_state(svc, format=FORMAT_VERSION)
+    log.info("master-tracker: snapshot layout %s applied (%d requests)" % (FORMAT_VERSION, len(reqs)))
 
 
 def snapshot_format_requests(gid, layout, nrows):
@@ -439,6 +490,7 @@ def snapshot_format_requests(gid, layout, nrows):
     reqs.append(_cell(gid, 0, 1, 0, 1, _fmt("#FFFFFF", NAVY, True), "userEnteredFormat(backgroundColor,textFormat)"))
     reqs.append(_cell(gid, 0, 1, 1, 2, _fmt(YELLOW_CELL, "#000000", True), "userEnteredFormat(backgroundColor,textFormat)"))
     reqs.append(_cell(gid, 0, 1, 3, 4, {"textFormat": {"italic": True, "foregroundColor": _rgb("#555555")}}, "userEnteredFormat.textFormat"))
+    reqs.append(_cell(gid, 0, 1, 9, 12, {"textFormat": {"italic": True, "foregroundColor": _rgb("#999999")}}, "userEnteredFormat.textFormat"))   # "Updated ..."
     for (h0, t) in (layout["week_rows"], layout["all_rows"]):
         h = h0 - 1                                                     # 0-based header row
         reqs.append(_cell(gid, h, h + 1, 0, len(SNAP_HEAD), dict(_fmt(NAVY, "#FFFFFF", True), horizontalAlignment="CENTER"), F))
@@ -454,67 +506,80 @@ def snapshot_format_requests(gid, layout, nrows):
     return reqs
 
 
-def write(svc, master, data, weeklist, agents):
-    if len(master) > MAX_ROWS or len(data) > MAX_ROWS:
-        raise RuntimeError("refusing to write %d/%d rows (cap %d)" % (len(master), len(data), MAX_ROWS))
-    ensure_tabs(svc)
+def write(svc, data, weeklist, agents, h):
+    """Rewrites MT DATA and WEEKLY SNAPSHOT. The hash is stored last, so a write
+    that dies half way is simply done again on the next cycle."""
+    if len(data) > MAX_ROWS:
+        raise RuntimeError("refusing to write %d rows (cap %d)" % (len(data), MAX_ROWS))
+    ensure_tabs(svc, need_rows=len(data))
     ensure_formatting(svc)
-    gids = _gids(svc)
-    # keep whatever week the user has selected in the dropdown
-    try:
+    gids = {p["title"]: p["sheetId"] for p in _props(svc)}
+    try:   # keep whatever week is selected in the dropdown
         cur = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!B1" % SNAP_TAB).execute().get("values", [[""]])
         choice = (cur[0][0] if cur and cur[0] else "") or "This week"
     except Exception:
         choice = "This week"
     snap, layout = snapshot_rows(agents, choice)
-    stamp = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+    stamp = _now().strftime("%d/%m %H:%M")
     svc.spreadsheets().values().batchClear(spreadsheetId=ARKLE, body={"ranges": [
-        "'%s'!A:T" % MASTER_TAB, "'%s'!A1:L200" % SNAP_TAB, "'%s'!A:N" % DATA_TAB]}).execute()
-    svc.spreadsheets().values().batchUpdate(spreadsheetId=ARKLE, body={"valueInputOption": "RAW", "data": [
-        {"range": "'%s'!A1" % MASTER_TAB, "values": master},
-        {"range": "'%s'!V1:W1" % MASTER_TAB, "values": [["Updated " + stamp, _last_hash or ""]]},
-    ]}).execute()
+        _ours("'%s'!A1:L200" % SNAP_TAB), _ours("'%s'!A:N" % DATA_TAB)]}).execute()
     svc.spreadsheets().values().batchUpdate(spreadsheetId=ARKLE, body={"valueInputOption": "USER_ENTERED", "data": [
-        {"range": "'%s'!A1" % DATA_TAB, "values": data},
-        {"range": "'%s'!M1" % DATA_TAB, "values": weeklist},
-        {"range": "'%s'!A1" % SNAP_TAB, "values": snap},
-        {"range": "'%s'!M1:N2" % SNAP_TAB, "values": [["start", layout["N1"]], ["end", layout["N2"]]]},
+        {"range": _ours("'%s'!A1" % DATA_TAB), "values": data},
+        {"range": _ours("'%s'!M1" % DATA_TAB), "values": weeklist},
+        {"range": _ours("'%s'!A1" % SNAP_TAB), "values": snap},
+        {"range": _ours("'%s'!J1" % SNAP_TAB), "values": [["Updated " + stamp]]},
+        {"range": _ours("'%s'!M1:N2" % SNAP_TAB), "values": [["start", layout["N1"]], ["end", layout["N2"]]]},
     ]}).execute()
     svc.spreadsheets().batchUpdate(spreadsheetId=ARKLE, body={"requests": snapshot_format_requests(gids[SNAP_TAB], layout, len(snap))}).execute()
+    write_state(svc, updated=_now().strftime("%d/%m/%Y %H:%M"), hash=h, code=CODE_VERSION)   # last: marks the write complete
 
 
-def run(svc, dry_run=True):
-    global _last_hash
-    master, data, weeklist, agents, n = build(svc)
-    h = hashlib.md5(repr([master, data, weeklist, agents, FORMAT_VERSION]).encode()).hexdigest()
+def _hash(data, weeklist, agents):
+    return hashlib.md5(repr([data, weeklist, agents, FORMAT_VERSION]).encode()).hexdigest()
+
+
+def run(svc, dry_run=True, poller=False):
+    global _last_hash, _stamped
     if _last_hash is None:
-        try:   # survive restarts: hash of the last write lives in MASTER TRACKER!W1
-            v = svc.spreadsheets().values().get(spreadsheetId=ARKLE, range="'%s'!W1" % MASTER_TAB).execute().get("values", [[""]])
-            _last_hash = v[0][0] if v and v[0] else ""
-        except Exception:
-            _last_hash = ""
+        _last_hash = read_state(svc).get("hash", "")
+    if poller and not dry_run and not _stamped:
+        # tells one_tab.py that the live poller is this build (it must be, before the tab is renamed)
+        if read_state(svc).get("code") != CODE_VERSION:
+            ensure_tabs(svc)
+            write_state(svc, code=CODE_VERSION)
+            log.info("master-tracker: build %s live" % CODE_VERSION)
+        _stamped = True
+    data, weeklist, agents, info = build(svc)            # raises -> nothing is written
+    n = len(data) - 1
+    desc = "%d on %s + %d Arkle-approved not on it" % (info["on_tracker"], info["tab"], info["legacy"])
+    h = _hash(data, weeklist, agents)
     if h == _last_hash:
-        log.info("master-tracker: no change (%d cases)" % n)
+        log.info("master-tracker: no change (%s)" % desc)
         return False
     if dry_run:
-        log.info("master-tracker [DRY RUN]: would write %d cases" % n)
+        log.info("master-tracker [DRY RUN]: would write %d rows (%s)" % (n, desc))
         return False
+    write(svc, data, weeklist, agents, h)
     _last_hash = h
-    write(svc, master, data, weeklist, agents)
-    log.info("master-tracker: wrote %d cases (%d agents, %d weeks)" % (n, len(agents), len(weeklist) - 4))
+    log.info("master-tracker: snapshot written - %s | %s" % (desc, ", ".join("%s %d" % kv for kv in sorted(info["people"].items()))))
     return True
 
 
 def tick(get_svc):
-    """Called every poller cycle; runs at most every INTERVAL_S."""
+    """Called every poller cycle; runs at most every INTERVAL_S (RETRY_S after a
+    cycle that could not read or is still waiting for the tab)."""
     global _last_tick
     if not ENABLED or time.time() - _last_tick < INTERVAL_S:
         return
     _last_tick = time.time()
     try:
-        run(get_svc(), dry_run=DRY_RUN)
+        run(get_svc(), dry_run=DRY_RUN, poller=True)
+    except NotReady as e:
+        _last_tick = time.time() - INTERVAL_S + RETRY_S
+        log.info("master-tracker: waiting - %s. Nothing written." % e)
     except Exception as e:
-        log.warning("master-tracker: failed: %s" % e)
+        _last_tick = time.time() - INTERVAL_S + RETRY_S
+        log.warning("master-tracker: not refreshed this cycle, snapshot left as it was (retry in %ds): %s" % (RETRY_S, e))
 
 
 if __name__ == "__main__":
@@ -522,12 +587,22 @@ if __name__ == "__main__":
     sys.path.insert(0, ".")
     import main
     svc = main.get_sheets_service()
-    master, data, weeklist, agents, n = build(svc)
-    print("cases:", n, "| agents:", agents, "| weeks:", len(weeklist) - 4)
-    print("newest band:", master[1][0]); print("first case:", master[2])
-    print("types:", collections.Counter(r[3] for r in data[1:]), "| legacy approvals:", sum(r[11] for r in data[1:]), "| approved total:", sum(r[7] for r in data[1:]))
+    try:
+        data, weeklist, agents, info = build(svc)
+    except NotReady as e:
+        print("waiting - %s. Nothing written." % e); sys.exit()
+    print("source tab: %s | cases on it: %d | Arkle-approved not on it: %d | Approved tab refs: %d" % (
+        info["tab"], info["on_tracker"], info["legacy"], info["approved_refs"]))
+    print("people (cases on the tab):", ", ".join("%s %d" % kv for kv in sorted(info["people"].items())))
+    today = _now().date(); wk = monday(today)
+    cols = ["IVA", "DMP", "IVAagr", "DMPagr", "SIP", "MOC", "Appr", "DNQ"]
+    for label, a, b in (("THIS WEEK", wk, wk + datetime.timedelta(days=6)), ("LAST WEEK", wk - datetime.timedelta(days=7), wk - datetime.timedelta(days=1)),
+                        ("ALL TIME", datetime.date(2024, 1, 1), today + datetime.timedelta(days=7))):
+        print("%s  (%s - %s)" % (label, a.strftime("%d/%m"), b.strftime("%d/%m")))
+        print("  %-12s" % "" + "".join("%7s" % c for c in cols))
+        for ag, v in counts(data, a, b).items():
+            print("  %-12s" % ag + "".join("%7d" % x for x in v))
     if os.getenv("GO") != "1":
-        print("preview only - GO=1 writes the tabs"); sys.exit()
-    _last_hash = hashlib.md5(repr([master, data, weeklist, agents, FORMAT_VERSION]).encode()).hexdigest()
-    write(svc, master, data, weeklist, agents)
-    print("written:", MASTER_TAB, ",", SNAP_TAB, "and", DATA_TAB)
+        print("preview only - GO=1 writes %s and %s (never %s)" % (SNAP_TAB, DATA_TAB, TRACKER_TAB)); sys.exit()
+    write(svc, data, weeklist, agents, _hash(data, weeklist, agents))
+    print("written:", SNAP_TAB, "and", DATA_TAB)
