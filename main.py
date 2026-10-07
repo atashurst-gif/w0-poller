@@ -64,7 +64,7 @@ def ping(suffix=""):
         pass  # never let a ping failure break the poll loop
 
 # BST sheet — 1Sp0Zo7j9a-73R4kYV-2MSQzXUb8BmlDD0hcCcTUcC1E
-# Tabs: "BST Form Meta", "BST Website"
+# Tabs: "BST Form Meta", "BST Website", "BST2"
 BST_SHEET_ID   = os.getenv("BST_SHEET_ID", "1Sp0Zo7j9a-73R4kYV-2MSQzXUb8BmlDD0hcCcTUcC1E")
 BST_TEMPLATE   = "bst_nc0"
 BST_TEMPLATE_DECLAN = "bst_w0"   # Declan tenant uses bst_w0, not bst_nc0
@@ -257,6 +257,15 @@ WATCH_TABS = [
         "template":    BST_TEMPLATE,
         "phone_col":   4,
         "name_col":    1,
+        "skip_rows":   1,
+    },
+    # BST2: Created(0) Form(1) Creative(2) FirstName(3) Surname(4) Email(5) Number(6)
+    {
+        "sheet_id":    BST_SHEET_ID,
+        "tab":         "BST2",
+        "template":    BST_TEMPLATE,
+        "phone_col":   6,
+        "name_col":    3,
         "skip_rows":   1,
     },
     # UKDT CT: Created(0) Form(1) AdName(2) FullName(3) Email(4) PhoneNumber(5)
