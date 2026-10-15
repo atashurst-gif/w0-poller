@@ -4,7 +4,7 @@
 1. The day grids
    Reads the 'PODs' tab (one row per POD booked) and fills the two time grids on
    the 'PODs TODAY' tab:
-     TODAY     PODs whose date (PODs column G) is today
+     TODAY     PODs dated today
      TOMORROW  PODs dated the next working day (on a Friday that is Monday)
    Every cycle, any POD not yet on its grid is put on the row for its time. If that
    row is already taken, or is the lunch block, a new row with the same time is
@@ -13,25 +13,20 @@
    new day), that grid is reset: extra rows removed, entries and highlight colours
    cleared, date updated, then filled again from PODs.
 
-2. Answered (Yes / No), linked both ways
-   The Answered column on the grid (H) has the same Yes/No dropdown as PODs (K).
-   A Yes/No picked on the grid is copied to PODs when PODs is blank, and one picked
-   on PODs is copied to the grid when the grid is blank, so PODs keeps the record
-   after the midnight reset.
+2. Answered + missed POD message (TODAY grid only)
+   Answered (Yes/No) lives only on the TODAY grid (column H). When a POD there is
+   marked No, the client gets the WATI template pod_missed_call1 (Regen's WATI)
+   once. The PODs row is stamped in its "Missed Call 1" column
+   ("1 - dd/mm/yyyy hh:mm", or "Failed - ..." if WATI refuses it) so it is never
+   sent twice. Nothing is sent until WATI shows the template as APPROVED.
 
-3. Missed POD message
-   When a POD is marked No, the client gets the WATI template pod_missed_call1
-   (Regen's WATI) once. PODs column M ("Missed Call 1") is stamped
-   "1 - dd/mm/yyyy hh:mm" when sent, or "Failed - ..." if WATI refuses it, so it is
-   never sent twice. Nothing is sent until WATI shows the template as APPROVED.
-   Only PODs dated today or in the last POD_MISSED_DAYS days (default 7) qualify.
+PODs columns are found by their headings (TL Reference, Name, the first Number,
+the Date next to Time, Time, Creditor Name, the Number after it, Notes), so adding
+or removing a column there does not break anything. The only write to PODs is
+the "Missed Call 1" column (added at the end if it is not there).
 
-Writes: 'PODs TODAY' (grids, Answered dropdowns) and, on 'PODs', only the Answered
-cell when it is blank (K) and the Missed Call 1 column (M).
-
-Columns copied (PODs -> PODs TODAY):
-  TL Reference B->C, Name C->D, Number D->E, Creditor Name I->F,
-  creditor Number J->G, Answered K->H, Notes L->I;  Time H -> the time row (B)
+Grid columns: B time, C TL Reference, D Name, E Number, F Creditor Name,
+G creditor Number, H Answered, I Notes.
 
 Standalone (from ~/Desktop/w0-poller):
   python3 pods_today.py          # preview: what it would do, writes and sends nothing
@@ -64,7 +59,6 @@ MISSED_ENABLED  = os.getenv("POD_MISSED_ENABLED", "1") == "1"
 MISSED_DRY_RUN  = os.getenv("POD_MISSED_DRY_RUN", "0") == "1"
 MISSED_TEMPLATE = os.getenv("POD_MISSED_TEMPLATE", "pod_missed_call1")
 MISSED_DAYS     = int(os.getenv("POD_MISSED_DAYS", "7"))
-MISSED_COL      = 12                      # PODs column M
 MISSED_HEADER   = "Missed Call 1"
 STAMP_FMT       = "%d/%m/%Y %H:%M"
 WATI_API_URL    = os.getenv("WATI_API_URL", "https://eu-api.wati.io/602557")
@@ -194,37 +188,66 @@ def wa_number(raw):
 
 
 def _col(idx):
-    return chr(65 + idx)
+    letters, idx = "", idx + 1
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
 
 
 # ── reading ───────────────────────────────────────────────────────────────────
 def read(svc):
     res = svc.spreadsheets().values().batchGet(
         spreadsheetId=SHEET_ID,
-        ranges=["'%s'!A:M" % SRC_TAB, "'%s'!A1:I500" % DST_TAB]).execute()
+        ranges=["'%s'!A:Z" % SRC_TAB, "'%s'!A1:I500" % DST_TAB]).execute()
     vr = res.get("valueRanges", [])
     return vr[0].get("values", []), vr[1].get("values", [])
 
 
+def src_columns(header):
+    """Find the PODs columns by their headings. Raises if the layout is not recognised."""
+    h = [str(x).strip().lower() for x in header]
+    def first(name, start=0):
+        for i in range(start, len(h)):
+            if h[i] == name:
+                return i
+        return None
+    c = {"tl": first("tl reference"), "name": first("name"), "phone": first("number"),
+         "time": first("time"), "creditor": first("creditor name"), "notes": first("notes"),
+         "missed": first(MISSED_HEADER.lower())}
+    if c["time"] is not None:
+        c["date"] = next((i for i in range(c["time"] - 1, -1, -1) if h[i] == "date"), None)
+    if c["creditor"] is not None:
+        c["cred_phone"] = first("number", c["creditor"] + 1)
+    need = ("tl", "name", "phone", "time", "date", "creditor")
+    missing = [k for k in need if c.get(k) is None]
+    if missing:
+        raise RuntimeError("PODs headings not recognised (missing %s) - nothing written" % ", ".join(missing))
+    if c["missed"] is None:
+        c["missed"] = max(i for i, x in enumerate(h) if x) + 1
+        c["missed_new"] = True
+    return c
+
+
 def pods_by_date(src):
-    """{date: [pod, ...]} from the PODs tab. Rows without a usable date/time or person are skipped."""
-    out, skipped = {}, 0
+    """({date: [pod, ...]}, columns) from the PODs tab. Rows without a usable date/time or person are skipped."""
+    cols = src_columns(src[0] if src else [])
+    g = lambda r, k: str(r[cols[k]]).strip() if cols.get(k) is not None and cols[k] < len(r) else ""
+    out = {}
     for i, r in enumerate(src[1:], start=2):
-        r = (list(r) + [""] * 13)[:13]
         if not any(str(x).strip() for x in r):
             continue
-        d, t = norm_date(r[6]), norm_time(r[7])
-        if not d or not t or not (str(r[3]).strip() or str(r[2]).strip()):
-            skipped += 1
+        d, t = norm_date(g(r, "date")), norm_time(g(r, "time"))
+        if not d or not t or not (g(r, "phone") or g(r, "name")):
             continue
-        vals = [str(x).strip() for x in (r[1], r[2], r[3], r[8], r[9], r[10], r[11])]
+        vals = [g(r, "tl"), g(r, "name"), g(r, "phone"), g(r, "creditor"), g(r, "cred_phone"), "", g(r, "notes")]
         out.setdefault(d, []).append({
-            "t": t, "d": d, "row": i, "vals": vals, "key": pod_key(r[3], r[1], r[2], t),
-            "name": str(r[2]).strip(), "phone": str(r[3]).strip(), "creditor": str(r[8]).strip(),
-            "answered": norm_answer(r[10]), "missed": str(r[12]).strip()})
+            "t": t, "d": d, "row": i, "vals": vals, "key": pod_key(g(r, "phone"), g(r, "tl"), g(r, "name"), t),
+            "name": g(r, "name"), "phone": g(r, "phone"), "creditor": g(r, "creditor"),
+            "missed": "" if cols.get("missed_new") else g(r, "missed")})
     for d in out:
         out[d].sort(key=lambda p: p["t"])
-    return out, skipped
+    return out, cols
 
 
 def sections(grid):
@@ -315,9 +338,9 @@ class Writer:
                                       "rule": YES_NO_RULE}}
 
 
-def src_values(svc, a1, rows, dry):
-    """The only writes to the PODs tab: Answered when blank (K) and Missed Call 1 (M)."""
-    assert re.match(r"^[KM]\d+$", a1), "pods-today: refusing to write %s on PODs" % a1
+def src_values(svc, a1, rows, dry, cols):
+    """The only write to the PODs tab: the Missed Call 1 column."""
+    assert re.match(r"^%s\d+$" % _col(cols["missed"]), a1), "pods-today: refusing to write %s on PODs" % a1
     if dry:
         return
     svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEET_ID, body={
@@ -350,13 +373,14 @@ def reset(w, sec, merged, name, target):
         return "%s: removed %d extra row(s) from %s" % (name, len(extras), _d(sec["date"]))
     plain = [row for row in sec["rows"] if row["r"] not in merged]
     w.clear(["C%d:I%d" % (row["r"], row["r"]) for row in plain if any(row["cells"])])
-    w.structure([w.white(row["r"]) for row in plain] + [w.dropdown(row["r"]) for row in plain])
+    w.structure([w.white(row["r"]) for row in plain] +
+                ([w.dropdown(row["r"]) for row in plain] if name == "TODAY" else []))
     w.values("D%d" % sec["label_row"], [[serial_date(target)]])
     return "%s: cleared %d entr(ies) from %s, date set to %s" % (
         name, sum(1 for row in plain if any(row["cells"])), _d(sec["date"]), target.strftime("%d/%m/%Y"))
 
 
-def place(w, sec, merged, pod):
+def place(w, sec, merged, pod, name="TODAY"):
     """Put one POD on the grid. Returns (description, structural_change)."""
     for row in sec["rows"]:
         if row["t"] == pod["t"] and row["r"] not in merged and not any(row["cells"]):
@@ -378,37 +402,9 @@ def place(w, sec, merged, pod):
     w.structure([{"insertDimension": {"range": {"sheetId": w.gid, "dimension": "ROWS",
                                                 "startIndex": at - 1, "endIndex": at},
                                       "inheritFromBefore": inherit}},
-                 w.white(at), w.dropdown(at)])
+                 w.white(at)] + ([w.dropdown(at)] if name == "TODAY" else []))
     w.values("B%d:I%d" % (at, at), [[serial_time(pod["t"])] + pod["vals"]])
     return "new row %d" % at, True
-
-
-# ── Answered link ─────────────────────────────────────────────────────────────
-def link_answered(svc, w, secs, pods, targets, dry):
-    """Copy Yes/No between the grid (H) and PODs (K), only into blanks. Returns lines."""
-    done, grid_writes = [], []
-    for name in SECTIONS:
-        sec, target = secs[name], targets[name]
-        by_key = {}
-        for p in pods.get(target, []):
-            by_key.setdefault(p["key"], []).append(p)
-        for row in sec["rows"]:
-            if not any(row["cells"]):
-                continue
-            k = pod_key(row["cells"][2], row["cells"][0], row["cells"][1], row["t"])
-            grid_ans = norm_answer(row["cells"][5])
-            for p in by_key.get(k, []):
-                if grid_ans and not p["answered"]:
-                    src_values(svc, "K%d" % p["row"], [[grid_ans]], dry)
-                    p["answered"] = grid_ans
-                    done.append("pods-today: Answered %s copied to PODs row %d (%s %s)" % (grid_ans, p["row"], p["t"], p["name"][:24]))
-                elif p["answered"] and not grid_ans:
-                    grid_writes.append(("H%d" % row["r"], p["answered"]))
-                    grid_ans = p["answered"]
-                    done.append("pods-today: Answered %s copied to %s grid row %d (%s %s)" % (p["answered"], name, row["r"], p["t"], p["name"][:24]))
-    for a1, v in grid_writes:
-        w.values(a1, [[v]])
-    return done
 
 
 # ── missed POD message ────────────────────────────────────────────────────────
@@ -481,13 +477,27 @@ def send_missed(pod, params):
     return False
 
 
-def chase_missed(svc, info, pods, now, dry):
-    """Send the missed-POD message for every POD marked No that has not had it. Returns lines."""
+def chase_missed(svc, info, secs, pods, cols, now, dry):
+    """Send the missed-POD message for every POD marked No on the TODAY grid that has not had it."""
     if not MISSED_ENABLED:
         return []
     today = now.date()
-    due = [p for d, ps in pods.items() if today - datetime.timedelta(days=MISSED_DAYS) <= d <= today
-           for p in ps if p["answered"] == "No" and not p["missed"]]
+    by_key = {}
+    for p in pods.get(today, []):
+        by_key.setdefault(p["key"], []).append(p)
+    due, unmatched = [], []
+    for row in secs["TODAY"]["rows"]:
+        if not any(row["cells"]) or norm_answer(row["cells"][5]) != "No":
+            continue
+        k = pod_key(row["cells"][2], row["cells"][0], row["cells"][1], row["t"])
+        ps = by_key.get(k)
+        if not ps:
+            unmatched.append("%s %s" % (row["t"], row["cells"][1][:24]))
+            continue
+        if not any(p["missed"] for p in ps):
+            due.append(ps[0])
+    if unmatched:
+        _warn_hourly("unmatched", "pod-missed: marked No on the TODAY grid but not on PODs for today, so not sent: %s" % "; ".join(unmatched))
     if not due:
         return []
     if not WATI_TOKEN:
@@ -498,36 +508,34 @@ def chase_missed(svc, info, pods, now, dry):
         _warn_hourly("approval", "pod-missed: %d POD(s) marked No are waiting - %s is %s in WATI, nothing sent until it is APPROVED"
                      % (len(due), MISSED_TEMPLATE, status or "not found"))
         return []
-    if info.get("src_cols", 13) < 13 and not dry:
-        svc.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body={"requests": [
-            {"appendDimension": {"sheetId": info["src_gid"], "dimension": "COLUMNS", "length": 13 - info["src_cols"]}}]}).execute()
-        info["src_cols"] = 13
+    quiet = dry or MISSED_DRY_RUN
+    if cols.get("missed_new") and not quiet:        # add the Missed Call 1 column (and the grid column if needed)
+        if info.get("src_cols", 0) <= cols["missed"]:
+            svc.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body={"requests": [
+                {"appendDimension": {"sheetId": info["src_gid"], "dimension": "COLUMNS",
+                                     "length": cols["missed"] + 1 - info["src_cols"]}}]}).execute()
+            info["src_cols"] = cols["missed"] + 1
+        src_values(svc, "%s1" % _col(cols["missed"]), [[MISSED_HEADER]], False, cols)
+        cols["missed_new"] = False
+    mc = _col(cols["missed"])
     done = []
     for p in due:
-        if not wa_number(p["phone"]) or len(wa_number(p["phone"])) < 11:
-            src_values(svc, "M%d" % p["row"], [["Failed - no valid number"]], dry or MISSED_DRY_RUN)
-            p["missed"] = "Failed"
-            done.append("pod-missed: row %d %s has no valid number - not sent" % (p["row"], p["name"][:24]))
+        if len(wa_number(p["phone"])) < 11:
+            src_values(svc, "%s%d" % (mc, p["row"]), [["Failed - no valid number"]], quiet, cols)
+            done.append("pod-missed: PODs row %d %s has no valid number - not sent" % (p["row"], p["name"][:24]))
             continue
-        if dry or MISSED_DRY_RUN:
+        if quiet:
             done.append("pod-missed: would send %s to %s (%s, POD %s %s)" % (MISSED_TEMPLATE, wa_number(p["phone"]), p["name"][:24], _d(p["d"]), p["t"]))
             continue
         ok = send_missed(p, params)
         if ok is None:
             continue
         stamp = ("1 - " if ok else "Failed - ") + now.strftime(STAMP_FMT)
-        src_values(svc, "M%d" % p["row"], [[stamp]], False)
+        src_values(svc, "%s%d" % (mc, p["row"]), [[stamp]], False, cols)
         p["missed"] = stamp
-        done.append("pod-missed: %s %s to %s (%s, POD %s %s) -> PODs M%d"
-                    % ("sent" if ok else "WATI refused", MISSED_TEMPLATE, wa_number(p["phone"]), p["name"][:24], _d(p["d"]), p["t"], p["row"]))
+        done.append("pod-missed: %s %s to %s (%s, POD %s %s) -> PODs %s%d"
+                    % ("sent" if ok else "WATI refused", MISSED_TEMPLATE, wa_number(p["phone"]), p["name"][:24], _d(p["d"]), p["t"], mc, p["row"]))
         time.sleep(1)
-    if done and not dry:
-        try:
-            hdr = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range="'%s'!M1" % SRC_TAB).execute().get("values", [])
-            if not hdr:
-                src_values(svc, "M1", [[MISSED_HEADER]], False)
-        except Exception:
-            pass
     return done
 
 
@@ -544,12 +552,12 @@ def run(svc, dry_run=False, now=None):
         secs = sections(grid)
         if any(n not in secs or not secs[n]["rows"] for n in SECTIONS):
             raise RuntimeError("could not find the TODAY and TOMORROW grids on %s - nothing written" % DST_TAB)
-        pods, _ = pods_by_date(src)
+        pods, cols = pods_by_date(src)
         info, w, again = None, None, False
         if not _dropdowns_done:                           # Yes/No chips on every grid row, once per start
             info = meta(svc)
             w = Writer(svc, info["gid"], dry_run)
-            w.structure([w.dropdown(r["r"]) for n in SECTIONS for r in secs[n]["rows"] if r["r"] not in info["merged"]])
+            w.structure([w.dropdown(r["r"]) for r in secs["TODAY"]["rows"] if r["r"] not in info["merged"]])
             _dropdowns_done = not dry_run
         for name in SECTIONS:
             sec, target = secs[name], targets[name]
@@ -568,7 +576,7 @@ def run(svc, dry_run=False, now=None):
             for p in missing:
                 info = info or meta(svc)
                 w = w or Writer(svc, info["gid"], dry_run)
-                where, structural = place(w, sec, info["merged"], p)
+                where, structural = place(w, sec, info["merged"], p, name)
                 done.append("pods-today: %s %s | %s | %s -> %s (%s)" % (
                     name, p["t"], p["vals"][1][:24], p["vals"][2], where, target.strftime("%d/%m/%Y")))
                 if structural:
@@ -578,12 +586,10 @@ def run(svc, dry_run=False, now=None):
                 break
         if again and not dry_run:
             continue
-        # grids are current: link Answered both ways, then send any missed-POD messages
-        info = info or meta(svc)
-        w = w or Writer(svc, info["gid"], dry_run)
-        done += link_answered(svc, w, secs, pods, targets, dry_run)
+        # grids are current: send any missed-POD messages for Nos on the TODAY grid
         try:
-            done += chase_missed(svc, info, pods, now, dry_run)
+            info = info or meta(svc)
+            done += chase_missed(svc, info, secs, pods, cols, now, dry_run)
         except Exception as e:
             _warn_hourly("chase", "pod-missed: not sent this cycle: %s" % e)
         return done
