@@ -2141,6 +2141,11 @@ def main():
             except Exception as e:
                 log.error("cbs-today: %s" % e)
             try:
+                import pods_today
+                pods_today.tick(get_sheets_service)
+            except Exception as _e:
+                log.warning("pods-today: %s" % _e)
+            try:
                 dhd_second_pass()
             except Exception as _e:
                 log.warning("dhd-2nd: pass failed: %s" % _e)
