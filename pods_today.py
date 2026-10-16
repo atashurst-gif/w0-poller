@@ -54,6 +54,7 @@ UK         = ZoneInfo("Europe/London")
 STANDARD   = {"%02d:%02d" % (h, m) for h in range(9, 17) for m in (0, 30)}   # 09:00 .. 16:30
 WHITE      = {"red": 1, "green": 1, "blue": 1}
 SECTIONS   = ("TODAY", "TOMORROW")
+LUNCH      = [t.strip() for t in os.getenv("PODS_LUNCH", "12:30,13:00").split(",") if t.strip()]   # merged LUNCH rows
 
 MISSED_ENABLED  = os.getenv("POD_MISSED_ENABLED", "1") == "1"
 MISSED_DRY_RUN  = os.getenv("POD_MISSED_DRY_RUN", "0") == "1"
@@ -167,6 +168,28 @@ def pod_key(number, tl, name, t):
     digits = "".join(c for c in str(number) if c.isdigit())[-9:]
     who = digits or str(tl).strip().upper() or str(name).strip().lower()
     return (who, t)
+
+
+def who_of(cells):
+    """The person on a grid row (number, else TL ref, else name) - the time is left out."""
+    return pod_key(cells[2], cells[0], cells[1], "")[0]
+
+
+def lunch_rows(sec):
+    """The template's lunch rows in this grid: the first row for each LUNCH time, if they sit together."""
+    rows = []
+    for t in LUNCH:
+        r = next((x for x in sec["rows"] if x["t"] == t), None)
+        if r is None:
+            return []
+        rows.append(r)
+    nums = [x["r"] for x in rows]
+    return rows if nums == list(range(nums[0], nums[0] + len(nums))) else []
+
+
+def _cells_range(gid, first, last):
+    return {"sheetId": gid, "startRowIndex": first - 1, "endRowIndex": last,
+            "startColumnIndex": 2, "endColumnIndex": 9}
 
 
 def wa_number(raw):
@@ -371,10 +394,21 @@ def reset(w, sec, merged, name, target):
                                                      "startIndex": r - 1, "endIndex": r}}}
                      for r in sorted(extras, reverse=True)])
         return "%s: removed %d extra row(s) from %s" % (name, len(extras), _d(sec["date"]))
-    plain = [row for row in sec["rows"] if row["r"] not in merged]
+    lunch = lunch_rows(sec)
+    lunch_nums = {x["r"] for x in lunch}
+    whole = bool(lunch) and all(merged.get(r) == (min(lunch_nums), max(lunch_nums)) for r in lunch_nums)
+    plain = [row for row in sec["rows"] if row["r"] not in merged or (row["r"] in lunch_nums and not whole)]
     w.clear(["C%d:I%d" % (row["r"], row["r"]) for row in plain if any(row["cells"])])
-    w.structure([w.white(row["r"]) for row in plain] +
-                ([w.dropdown(row["r"]) for row in plain] if name == "TODAY" else []))
+    reqs = [w.white(row["r"]) for row in plain]
+    if name == "TODAY":
+        reqs += [w.dropdown(row["r"]) for row in plain if row["r"] not in lunch_nums]
+    if lunch and not whole:                              # a POD split the lunch block - put it back
+        first, last = min(lunch_nums), max(lunch_nums)
+        reqs += [{"unmergeCells": {"range": _cells_range(w.gid, first, last)}},
+                 {"mergeCells": {"range": _cells_range(w.gid, first, last), "mergeType": "MERGE_ALL"}}]
+    w.structure(reqs)
+    if lunch and not whole:
+        w.values("C%d" % min(lunch_nums), [["LUNCH"]])
     w.values("D%d" % sec["label_row"], [[serial_date(target)]])
     return "%s: cleared %d entr(ies) from %s, date set to %s" % (
         name, sum(1 for row in plain if any(row["cells"])), _d(sec["date"]), target.strftime("%d/%m/%Y"))
@@ -387,6 +421,35 @@ def place(w, sec, merged, pod, name="TODAY"):
             w.values("C%d:I%d" % (row["r"], row["r"]), [pod["vals"]])
             row["cells"] = list(pod["vals"])
             return "row %d" % row["r"], False
+    solo = next((x for x in sec["rows"] if x["t"] == pod["t"] and x["r"] not in merged
+                 and x["cells"][0].upper() == "LUNCH" and not any(x["cells"][1:])), None)
+    if solo is not None:                                 # what is left of lunch at that time: the POD takes it
+        reqs = [w.white(solo["r"])] + ([w.dropdown(solo["r"])] if name == "TODAY" else [])
+        w.structure(reqs)
+        w.values("C%d:I%d" % (solo["r"], solo["r"]), [pod["vals"]])
+        solo["cells"] = list(pod["vals"])
+        return "lunch row %d" % solo["r"], False
+    slot = next((x for x in sec["rows"] if x["t"] == pod["t"] and x["r"] in merged), None)
+    if slot is not None:                                 # booked in the lunch block: give it that row
+        first, last = merged[slot["r"]]
+        rest = [r for r in range(first, last + 1) if r != slot["r"]]
+        reqs = [{"unmergeCells": {"range": _cells_range(w.gid, first, last)}}, w.white(slot["r"])]
+        runs, run = [], []
+        for r in rest:                                   # what is left of the lunch block stays merged
+            if run and r != run[-1] + 1:
+                runs.append(run); run = []
+            run.append(r)
+        if run:
+            runs.append(run)
+        reqs += [{"mergeCells": {"range": _cells_range(w.gid, rn[0], rn[-1]), "mergeType": "MERGE_ALL"}}
+                 for rn in runs if len(rn) > 1]
+        if name == "TODAY":
+            reqs.append(w.dropdown(slot["r"]))
+        w.structure(reqs)
+        w.values("C%d:I%d" % (slot["r"], slot["r"]), [pod["vals"]])
+        for rn in runs:
+            w.values("C%d" % rn[0], [["LUNCH"]])
+        return "lunch row %d (lunch block split)" % slot["r"], True
     after = None
     for row in sec["rows"]:
         if row["t"] <= pod["t"]:
@@ -482,20 +545,20 @@ def chase_missed(svc, info, secs, pods, cols, now, dry):
     if not MISSED_ENABLED:
         return []
     today = now.date()
-    by_key = {}
+    by_who = {}
     for p in pods.get(today, []):
-        by_key.setdefault(p["key"], []).append(p)
+        by_who.setdefault(p["key"][0], []).append(p)
     due, unmatched = [], []
     for row in secs["TODAY"]["rows"]:
         if not any(row["cells"]) or norm_answer(row["cells"][5]) != "No":
             continue
-        k = pod_key(row["cells"][2], row["cells"][0], row["cells"][1], row["t"])
-        ps = by_key.get(k)
+        ps = by_who.get(who_of(row["cells"]))
         if not ps:
             unmatched.append("%s %s" % (row["t"], row["cells"][1][:24]))
             continue
-        if not any(p["missed"] for p in ps):
-            due.append(ps[0])
+        if any(p["missed"] for p in ps) or any(p is d for d in due for p in ps):
+            continue
+        due.append(next((p for p in ps if p["t"] == row["t"]), ps[0]))
     if unmatched:
         _warn_hourly("unmatched", "pod-missed: marked No on the TODAY grid but not on PODs for today, so not sent: %s" % "; ".join(unmatched))
     if not due:
@@ -567,12 +630,21 @@ def run(svc, dry_run=False, now=None):
                 done.append("pods-today: " + reset(w, sec, info["merged"], name, target))
                 again = True
                 break
-            present = {pod_key(r["cells"][2], r["cells"][0], r["cells"][1], r["t"])
-                       for r in sec["rows"] if any(r["cells"])}
-            seen, missing = set(), []
+            on_grid, on_grid_t = {}, set()
+            for r in sec["rows"]:
+                if any(r["cells"]) and r["cells"][0].upper() != "LUNCH":
+                    on_grid[who_of(r["cells"])] = on_grid.get(who_of(r["cells"]), 0) + 1
+                    on_grid_t.add((who_of(r["cells"]), r["t"]))
+            by_who = {}
             for p in pods.get(target, []):
-                if p["key"] not in present and p["key"] not in seen:
-                    seen.add(p["key"]); missing.append(p)
+                by_who.setdefault(p["key"][0], []).append(p)
+            missing = []
+            for who, ps in by_who.items():               # one grid row per POD; a time changed on the grid still counts
+                need = len(ps) - on_grid.get(who, 0)
+                if need > 0:
+                    order = [p for p in ps if (who, p["t"]) not in on_grid_t] + [p for p in ps if (who, p["t"]) in on_grid_t]
+                    missing += order[:need]
+            missing.sort(key=lambda p: p["t"])
             for p in missing:
                 info = info or meta(svc)
                 w = w or Writer(svc, info["gid"], dry_run)
