@@ -96,6 +96,11 @@ HANDLER_FILL_ENABLED = os.getenv("HANDLER_FILL_ENABLED", "1") == "1"
 HANDLER_FILL_DRY_RUN = os.getenv("HANDLER_FILL_DRY_RUN", "0") == "1"
 HANDLER_NAME_MAP = {"declan": TPA_TAG}       # Declan's rows are written as the TPA tag name (Aaron, 18 Oct 18:37: "TPA"); others as they come: Josh, Leah, Noor
 ROTA_BY_PHONE = {}                            # last 9 digits of the number -> handler name, rebuilt from the enquiry tabs every cycle
+# WATI tags are applied when the W0 goes out; this makes sure every recent chat carries its tag even if the tag did not exist
+# in WATI at that moment, or the poller was restarting (18 Oct: the tags were created minutes after the first lead went out).
+ROTA_TAG_TODO = {}                            # phone key -> tag wanted (from the same rows as ROTA_BY_PHONE)
+_ROTA_TAG_DONE = {}                           # phone key -> (tag, ok, when) of the last attempt
+ROTA_TAG_RETRY_SECS = int(os.getenv("ROTA_TAG_RETRY_SECS", "1800"))
 STOPPED_SEQUENCE_STATUSES = {
     "replied", "completed", "opted out", "converted", "do not contact",
     "dnc", "dnq", "callback", "interested", "agreed", "lead passed",
@@ -720,7 +725,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         set_lead_attributes_retry(raw_phone, brand_source)
     if status == "ok" and tab_cfg.get("tag"):
         try:
-            tag_regen_conversation(raw_phone, tab_cfg["tag"])
+            _ROTA_TAG_DONE[_phone_key(raw_phone)] = (tab_cfg["tag"], tag_regen_conversation(raw_phone, tab_cfg["tag"]), time.time())
         except Exception as _e:
             log.warning("regen-tag: %s" % _e)
     # whose enquiry it is (Hub rota), from the trailing column the lead zaps / websites write: tag the chat with that name
@@ -728,7 +733,8 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     rota_name = (str(row[rota_col]).strip() if rota_col is not None and len(row) > rota_col and row[rota_col] else "")
     if status == "ok" and rota_name and not tab_cfg.get("tag"):
         try:
-            tag_regen_conversation(raw_phone, ROTA_TAG_MAP.get(rota_name.lower(), rota_name))
+            _t = ROTA_TAG_MAP.get(rota_name.lower(), rota_name)
+            _ROTA_TAG_DONE[_phone_key(raw_phone)] = (_t, tag_regen_conversation(raw_phone, _t), time.time())
         except Exception as _e:
             log.warning("rota-tag: %s" % _e)
     if status == "ok" and service:
@@ -790,6 +796,7 @@ def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 400):
             name = HANDLER_NAME_MAP.get(raw.lower(), raw[:1].upper() + raw[1:])
         if name:
             ROTA_BY_PHONE[key] = name
+            ROTA_TAG_TODO[key] = (TPA_TAG if name == HANDLER_NAME_MAP["declan"] else ROTA_TAG_MAP.get(name.lower(), name), str(row[phone_col]).strip())
 
 
 def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
@@ -813,6 +820,29 @@ def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
         svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
                                                 body={"valueInputOption": "RAW", "data": data}).execute()
     return len(data)
+
+
+def ensure_rota_tags():
+    """Apply the rota tag to every recent chat that should have one (idempotent in WATI); a failed one is retried after
+    ROTA_TAG_RETRY_SECS so a tag created later in WATI still lands."""
+    if not ROTA_TAG_TODO or not WATI_API_URL or not WATI_TOKEN:
+        return 0
+    now = time.time()
+    done = 0
+    for key, (tag, phone) in list(ROTA_TAG_TODO.items()):
+        last = _ROTA_TAG_DONE.get(key)
+        if last and (last[0] == tag and (last[1] or now - last[2] < ROTA_TAG_RETRY_SECS)):
+            continue
+        try:
+            ok = tag_regen_conversation(phone, tag)
+        except Exception as e:
+            log.warning("rota-tag: %s" % e)
+            ok = False
+        _ROTA_TAG_DONE[key] = (tag, ok, now)
+        done += 1 if ok else 0
+        if done >= 25:
+            break
+    return done
 
 
 def fill_callback_handlers(svc):
@@ -2357,6 +2387,10 @@ def main():
                 fill_callback_handlers(service)
             except Exception as _e:
                 log.warning("handler: %s" % _e)
+            try:
+                ensure_rota_tags()
+            except Exception as _e:
+                log.warning("rota-tag: %s" % _e)
             sync_callback_set(service)
             sync_cbna(service)
             # retired Aug 2026 - Josh works in Apps 2.0: sync_josh_bookings(service)
