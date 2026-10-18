@@ -767,6 +767,44 @@ def _row_day(v):
 
 
 HANDLER_INDEX_DAYS = int(os.getenv("HANDLER_INDEX_DAYS", "2"))   # only enquiries this recent are matched ("starting from today")
+# Backfill (Aaron, 18 Oct 19:00): everything that came into Regen's WATI over the weekend, before the rota column existed, is
+# Josh's (the only Regen person on the rota; Declan's share only starts with cases created in his own TrustLink). Rows on the
+# Regen tabs created in this window with no rota name are treated as his - tagged in WATI and named on the tracker.
+ROTA_BACKFILL_OWNER = os.getenv("ROTA_BACKFILL_OWNER", "Josh")
+ROTA_BACKFILL_FROM  = os.getenv("ROTA_BACKFILL_FROM", "2026-10-17")            # UK date, inclusive
+ROTA_BACKFILL_UNTIL = os.getenv("ROTA_BACKFILL_UNTIL", "2026-10-18 18:15")     # UK time: the zaps write the name from here on
+
+
+def _row_when(v):
+    """UK wall-clock datetime of a Created cell (serials are UTC from Meta; text is taken as written). None if unreadable."""
+    t = str(v or "").strip()
+    if not t:
+        return None
+    try:
+        if t.replace(".", "", 1).isdigit():
+            utc = datetime.datetime(1899, 12, 30) + datetime.timedelta(days=float(t))
+            return utc.replace(tzinfo=datetime.timezone.utc).astimezone(UK_TZ).replace(tzinfo=None)
+        t2 = t[:19].replace("T", " ")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+            try:
+                return datetime.datetime.strptime(t2, fmt)
+            except ValueError:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _in_backfill_window(created) -> bool:
+    w = _row_when(created)
+    if w is None:
+        return False
+    try:
+        lo = datetime.datetime.strptime(ROTA_BACKFILL_FROM, "%Y-%m-%d")
+        hi = datetime.datetime.strptime(ROTA_BACKFILL_UNTIL, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return lo <= w < hi
 
 
 def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 400):
@@ -794,6 +832,8 @@ def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 400):
         elif rota_col is not None and len(row) > rota_col and str(row[rota_col]).strip():
             raw = str(row[rota_col]).strip()
             name = HANDLER_NAME_MAP.get(raw.lower(), raw[:1].upper() + raw[1:])
+        elif ROTA_BACKFILL_OWNER and not tab_cfg.get("wati") and _in_backfill_window(row[0] if row else ""):
+            name = ROTA_BACKFILL_OWNER
         if name:
             ROTA_BY_PHONE[key] = name
             ROTA_TAG_TODO[key] = (TPA_TAG if name == HANDLER_NAME_MAP["declan"] else ROTA_TAG_MAP.get(name.lower(), name), str(row[phone_col]).strip())
@@ -2078,6 +2118,10 @@ def tag_regen_conversation(raw_phone, tag, _variant=False):
     if r.status_code == 200:
         log.info("regen-tag: %s -> %s" % (phone, tag))
         return True
+    if r.status_code == 404 and "conversation" in r.text.lower():
+        if not _variant:
+            log.info("regen-tag: %s -> %s: no chat on Regen's WATI (sent from elsewhere or never delivered)" % (phone, tag))
+        return "no-conversation"      # truthy: final, nothing to retry
     # the tag exists but was typed in WATI with different capitals (josh / JOSH / Josh): try those spellings before giving up
     if r.status_code == 404 and "tag" in r.text.lower() and not _variant:
         for alt in (tag.lower(), tag.capitalize(), tag.upper()):
