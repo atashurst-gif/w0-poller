@@ -94,7 +94,7 @@ ROTA_TAG_MAP = {"declan": TPA_TAG}
 # handler of any WATI-booked row in Apps 2.0 and CB'S TODAY whose number it recognises. Never overwrites a handler already set.
 HANDLER_FILL_ENABLED = os.getenv("HANDLER_FILL_ENABLED", "1") == "1"
 HANDLER_FILL_DRY_RUN = os.getenv("HANDLER_FILL_DRY_RUN", "0") == "1"
-HANDLER_NAME_MAP = {"declan": "Declan"}      # the handler name written for each rota key/name (others are written as they come: Josh, Leah, Noor)
+HANDLER_NAME_MAP = {"declan": TPA_TAG}       # Declan's rows are written as the TPA tag name (Aaron, 18 Oct 18:37: "TPA"); others as they come: Josh, Leah, Noor
 ROTA_BY_PHONE = {}                            # last 9 digits of the number -> handler name, rebuilt from the enquiry tabs every cycle
 STOPPED_SEQUENCE_STATUSES = {
     "replied", "completed", "opted out", "converted", "do not contact",
@@ -784,7 +784,7 @@ def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 400):
         name = ""
         form = str(row[1]).strip().lower() if len(row) > 1 and row[1] else ""
         if tab_is_tpa or (tab == "UKDTCTD1 (Dec)" and form == "ukdt ct vid susan dec"):
-            name = "Declan"
+            name = HANDLER_NAME_MAP["declan"]
         elif rota_col is not None and len(row) > rota_col and str(row[rota_col]).strip():
             raw = str(row[rota_col]).strip()
             name = HANDLER_NAME_MAP.get(raw.lower(), raw[:1].upper() + raw[1:])
