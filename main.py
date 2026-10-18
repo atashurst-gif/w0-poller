@@ -83,6 +83,11 @@ SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST", "ukdt_josh": "UKDT CT"
 # TPA = The Peoples Advisory (Declan). His UKDT/BST leads live on REGEN's WATI, stamped lead_source *_tpa and tagged TPA,
 # so he and Regen's people can tell them apart; only his DHD leads use his own tenant.
 TPA_TAG = os.getenv("TPA_TAG", "TPA")
+# 18/10 (evening): the lead zaps and the websites write whose enquiry it is (Hub rota: Josh / Leah / Noor / Declan) in a
+# trailing column of the Regen tabs ("rota_col" below). After a successful send the chat is tagged with that name, so
+# Regen's people see in WATI what TrustLink's Lead Gen column shows. The tag must exist in WATI (Settings > Tags);
+# a missing tag is logged and the message still goes. Declan's rows live on the TPA tabs and are tagged TPA.
+ROTA_TAG_MAP = {"declan": TPA_TAG}
 STOPPED_SEQUENCE_STATUSES = {
     "replied", "completed", "opted out", "converted", "do not contact",
     "dnc", "dnq", "callback", "interested", "agreed", "lead passed",
@@ -251,6 +256,7 @@ WATCH_TABS = [
         "template":    BST_TEMPLATE,
         "phone_col":   6,
         "name_col":    3,
+        "rota_col":    7,
         "skip_rows":   1,
     },
     # BST Website: Form(0) FirstName(1) Surname(2) Email(3) Number(4) Source(5)
@@ -260,6 +266,7 @@ WATCH_TABS = [
         "template":    BST_TEMPLATE,
         "phone_col":   4,
         "name_col":    1,
+        "rota_col":    6,
         "skip_rows":   1,
     },
     # BST2: Created(0) Form(1) Creative(2) FirstName(3) Surname(4) Email(5) Number(6)
@@ -304,6 +311,7 @@ WATCH_TABS = [
         "template":    UKDT_TEMPLATE,
         "phone_col":   5,
         "name_col":    3,
+        "rota_col":    6,
         "skip_rows":   1,
         "full_name":   True,   # name col contains full name — extract first word
     },
@@ -325,6 +333,7 @@ WATCH_TABS = [
         "lead_source": "ukdt_o",
         "phone_col":   4,
         "name_col":    2,
+        "rota_col":    7,
         "skip_rows":   1,
     },
     # UKDT GDC1: Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
@@ -335,6 +344,7 @@ WATCH_TABS = [
         "lead_source": "gds",
         "phone_col":   5,
         "name_col":    3,
+        "rota_col":    6,
         "skip_rows":   1,
         "full_name":   True,
     },
@@ -346,6 +356,7 @@ WATCH_TABS = [
         "lead_source": "ukdt_josh",
         "phone_col":   5,
         "name_col":    3,
+        "rota_col":    6,
         "skip_rows":   1,
         "full_name":   True,
     },
@@ -373,6 +384,7 @@ WATCH_TABS = [
         "template":    UKDT_TEMPLATE,
         "phone_col":   5,
         "name_col":    3,
+        "rota_col":    6,
         "skip_rows":   1,
         "full_name":   True,
     },
@@ -703,6 +715,14 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             tag_regen_conversation(raw_phone, tab_cfg["tag"])
         except Exception as _e:
             log.warning("regen-tag: %s" % _e)
+    # whose enquiry it is (Hub rota), from the trailing column the lead zaps / websites write: tag the chat with that name
+    rota_col = tab_cfg.get("rota_col")
+    rota_name = (str(row[rota_col]).strip() if rota_col is not None and len(row) > rota_col and row[rota_col] else "")
+    if status == "ok" and rota_name and not tab_cfg.get("tag"):
+        try:
+            tag_regen_conversation(raw_phone, ROTA_TAG_MAP.get(rota_name.lower(), rota_name))
+        except Exception as _e:
+            log.warning("rota-tag: %s" % _e)
     if status == "ok" and service:
         lead_source = LEAD_SOURCE_MAP.get(template, template.replace("_w0", "")).upper()
         append_w0_tracking_row(service, raw_phone, first_name, lead_source, "w0 sent")
