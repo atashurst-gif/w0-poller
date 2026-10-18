@@ -88,6 +88,14 @@ TPA_TAG = os.getenv("TPA_TAG", "TPA")
 # Regen's people see in WATI what TrustLink's Lead Gen column shows. The tag must exist in WATI (Settings > Tags);
 # a missing tag is logged and the message still goes. Declan's rows live on the TPA tabs and are tagged TPA.
 ROTA_TAG_MAP = {"declan": TPA_TAG}
+# 18/10 (Aaron, 18:0x): callbacks booked through WATI (the booking page -> Zap -> Apps 2.0, Platform "WATI A") must carry the
+# right person's name in the Arkle sheet's "ReGen Handler" column. The poller already knows whose enquiry each number is (the
+# rota column on the enquiry tabs; the TPA tabs and Susan Dec video rows are Declan's), so every cycle it fills the blank
+# handler of any WATI-booked row in Apps 2.0 and CB'S TODAY whose number it recognises. Never overwrites a handler already set.
+HANDLER_FILL_ENABLED = os.getenv("HANDLER_FILL_ENABLED", "1") == "1"
+HANDLER_FILL_DRY_RUN = os.getenv("HANDLER_FILL_DRY_RUN", "0") == "1"
+HANDLER_NAME_MAP = {"declan": "Declan"}      # the handler name written for each rota key/name (others are written as they come: Josh, Leah, Noor)
+ROTA_BY_PHONE = {}                            # last 9 digits of the number -> handler name, rebuilt from the enquiry tabs every cycle
 STOPPED_SEQUENCE_STATUSES = {
     "replied", "completed", "opted out", "converted", "do not contact",
     "dnc", "dnq", "callback", "interested", "agreed", "lead passed",
@@ -728,6 +736,69 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         append_w0_tracking_row(service, raw_phone, first_name, lead_source, "w0 sent")
     return status
 
+def _phone_key(v) -> str:
+    d = "".join(c for c in str(v or "") if c.isdigit())
+    return d[-9:] if len(d) >= 9 else ""
+
+
+def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 800):
+    """Remember whose enquiry each number is, from the tab's rows: the TPA tabs and Susan Dec video rows are Declan's,
+    otherwise the rota column (Josh / Leah / Noor / Declan) the zaps and websites write. Rows without a name are skipped."""
+    phone_col = tab_cfg["phone_col"]
+    rota_col = tab_cfg.get("rota_col")
+    tab = tab_cfg["tab"]
+    tab_is_tpa = (tab_cfg.get("tag") == TPA_TAG)
+    for row in data_rows[-last_n:]:
+        if len(row) <= phone_col:
+            continue
+        key = _phone_key(row[phone_col])
+        if not key:
+            continue
+        name = ""
+        form = str(row[1]).strip().lower() if len(row) > 1 and row[1] else ""
+        if tab_is_tpa or (tab == "UKDTCTD1 (Dec)" and form == "ukdt ct vid susan dec"):
+            name = "Declan"
+        elif rota_col is not None and len(row) > rota_col and str(row[rota_col]).strip():
+            raw = str(row[rota_col]).strip()
+            name = HANDLER_NAME_MAP.get(raw.lower(), raw[:1].upper() + raw[1:])
+        if name:
+            ROTA_BY_PHONE[key] = name
+
+
+def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
+    """Fill column F (ReGen Handler) where it is blank on WATI-booked rows (Platform starts WATI) whose number we know."""
+    rng = "'%s'!A%d:L" % (tab, first_row)
+    rows = svc.spreadsheets().values().get(spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
+    data = []
+    for i, r in enumerate(rows):
+        r = (r + [""] * 12)[:12]
+        if r[5].strip():
+            continue                                  # handler already there - never overwritten
+        if not r[6].strip().upper().startswith("WATI"):
+            continue                                  # only callbacks that came through WATI
+        name = ROTA_BY_PHONE.get(_phone_key(r[3]))
+        if not name:
+            continue
+        rownum = first_row + i
+        data.append({"range": "'%s'!F%d" % (tab, rownum), "values": [[name]]})
+        log.info("handler: %s row %d (%s %s) -> %s%s" % (tab, rownum, r[7], r[8], name, " [DRY RUN]" if HANDLER_FILL_DRY_RUN else ""))
+    if data and not HANDLER_FILL_DRY_RUN:
+        svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                                body={"valueInputOption": "RAW", "data": data}).execute()
+    return len(data)
+
+
+def fill_callback_handlers(svc):
+    if not HANDLER_FILL_ENABLED or not ROTA_BY_PHONE:
+        return 0
+    n = _fill_handlers_in(svc, "Apps 2.0", 2)
+    try:
+        n += _fill_handlers_in(svc, CBS_TODAY_TAB, CBS_TODAY_FIRST_ROW)
+    except Exception as e:
+        log.warning("handler: %s: %s" % (CBS_TODAY_TAB, e))
+    return n
+
+
 def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
     sheet_id  = tab_cfg["sheet_id"]
     tab       = tab_cfg["tab"]
@@ -747,6 +818,10 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
     rows = result.get("values", [])
     data_rows = rows[skip:]  # skip header
     total = len(data_rows)
+    try:
+        _index_rota_owners(tab_cfg, data_rows)
+    except Exception as _e:
+        log.warning("rota-index: %s" % _e)
 
     # First run — record current count, fire nothing (don't spam existing data)
     if key not in seen:
@@ -1932,7 +2007,7 @@ def tag_declan_conversation(raw_phone, tag):
     return False
 
 
-def tag_regen_conversation(raw_phone, tag):
+def tag_regen_conversation(raw_phone, tag, _variant=False):
     """Regen tenant: POST /api/ext/v3/conversations/{phone}/tags {tag_name}. Idempotent; the tag must already exist
     in WATI (create it once under Settings > Tags) — a missing tag is logged, never fatal, and lead_source still marks the lead."""
     if not tag or not WATI_API_URL or not WATI_TOKEN:
@@ -1946,7 +2021,13 @@ def tag_regen_conversation(raw_phone, tag):
     if r.status_code == 200:
         log.info("regen-tag: %s -> %s" % (phone, tag))
         return True
-    log.warning("regen-tag: %s -> %s FAILED http %s %s" % (phone, tag, r.status_code, r.text[:120]))
+    # the tag exists but was typed in WATI with different capitals (josh / JOSH / Josh): try those spellings before giving up
+    if r.status_code == 404 and "tag" in r.text.lower() and not _variant:
+        for alt in (tag.lower(), tag.capitalize(), tag.upper()):
+            if alt != tag and tag_regen_conversation(raw_phone, alt, _variant=True):
+                return True
+    if not _variant:
+        log.warning("regen-tag: %s -> %s FAILED http %s %s" % (phone, tag, r.status_code, r.text[:120]))
     return False
 
 
@@ -2245,6 +2326,10 @@ def main():
                 fired = poll_tab(service, tab_cfg, seen)
                 total_fired += fired
             save_seen(seen)
+            try:
+                fill_callback_handlers(service)
+            except Exception as _e:
+                log.warning("handler: %s" % _e)
             sync_callback_set(service)
             sync_cbna(service)
             # retired Aug 2026 - Josh works in Apps 2.0: sync_josh_bookings(service)
