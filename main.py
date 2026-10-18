@@ -271,6 +271,20 @@ WATCH_TABS = [
         "name_col":    3,
         "skip_rows":   1,
     },
+    # UKDT GDS TPA — Declan's share of the general-debt sources (website enquiries and the GDC1/GDS1 Meta form, decided by the
+    # Hub rota): the same ukdt_gds_w0 those tabs send, from Regen's WATI, stamped ukdt_tpa and tagged TPA.
+    # Layout like the Meta tabs: Created(0) Form(1) Source(2) FullName(3) Email(4) Phone(5)
+    {
+        "sheet_id":    UKDT_SHEET_ID,
+        "tab":         "UKDT GDS TPA",
+        "template":    "ukdt_gds_w0",
+        "lead_source": "ukdt_tpa",
+        "tag":         TPA_TAG,
+        "phone_col":   5,
+        "name_col":    3,
+        "skip_rows":   1,
+        "full_name":   True,
+    },
     # BST TPA — Declan's share of the main bailiff form (Hub rota; TrustLink source 6178), layout of BST Form Meta;
     # Regen's WATI, bst_nc0, lead_source=bst_tpa, tagged TPA.
     {
