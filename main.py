@@ -741,15 +741,42 @@ def _phone_key(v) -> str:
     return d[-9:] if len(d) >= 9 else ""
 
 
-def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 800):
-    """Remember whose enquiry each number is, from the tab's rows: the TPA tabs and Susan Dec video rows are Declan's,
-    otherwise the rota column (Josh / Leah / Noor / Declan) the zaps and websites write. Rows without a name are skipped."""
+def _row_day(v):
+    """The day (UTC date) an enquiry row was created, from the Created cell: a Google serial, 'YYYY-MM-DD hh:mm', or
+    'M/D/YYYY hh:mm:ss'. None if unreadable."""
+    t = str(v or "").strip()
+    if not t:
+        return None
+    try:
+        if t.replace(".", "", 1).isdigit():
+            return (datetime.datetime(1899, 12, 30) + datetime.timedelta(days=float(t))).date()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+            try:
+                return datetime.datetime.strptime(t[:19] if "T" not in t else t[:19].replace("T", " "), fmt).date()
+            except ValueError:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+HANDLER_INDEX_DAYS = int(os.getenv("HANDLER_INDEX_DAYS", "2"))   # only enquiries this recent are matched ("starting from today")
+
+
+def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 400):
+    """Remember whose enquiry each number is, from the tab's recent rows: the TPA tabs and Susan Dec video rows are Declan's,
+    otherwise the rota column (Josh / Leah / Noor / Declan) the zaps and websites write. Rows without a name, or older than
+    HANDLER_INDEX_DAYS, are skipped."""
     phone_col = tab_cfg["phone_col"]
     rota_col = tab_cfg.get("rota_col")
     tab = tab_cfg["tab"]
     tab_is_tpa = (tab_cfg.get("tag") == TPA_TAG)
+    cutoff = datetime.datetime.now(UK_TZ).date() - datetime.timedelta(days=HANDLER_INDEX_DAYS)
     for row in data_rows[-last_n:]:
         if len(row) <= phone_col:
+            continue
+        day = _row_day(row[0]) if row else None
+        if day is None or day < cutoff:
             continue
         key = _phone_key(row[phone_col])
         if not key:
