@@ -79,7 +79,10 @@ DECLAN_AUTOMATION_SHEET_ID = os.getenv("DECLAN_AUTOMATION_SHEET_ID", "1FsEIcfd8e
 W0_TRACKING_SHEET_ID = os.getenv("W0_TRACKING_SHEET_ID", AUTOMATION_SHEET_ID)
 W0_TRACKING_TAB = os.getenv("W0_TRACKING_TAB", "W0 Tracking")
 BOOKING_PENDING_STATUS = "booking pending"
-SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST", "ukdt_josh": "UKDT CT"}
+SEQUENCE_CAMPAIGN_MAP = {"ukdt": "UKDT CT", "bst": "BST", "ukdt_josh": "UKDT CT", "ukdt_tpa": "UKDT CT", "bst_tpa": "BST"}
+# TPA = The Peoples Advisory (Declan). His UKDT/BST leads live on REGEN's WATI, stamped lead_source *_tpa and tagged TPA,
+# so he and Regen's people can tell them apart; only his DHD leads use his own tenant.
+TPA_TAG = os.getenv("TPA_TAG", "TPA")
 STOPPED_SEQUENCE_STATUSES = {
     "replied", "completed", "opted out", "converted", "do not contact",
     "dnc", "dnq", "callback", "interested", "agreed", "lead passed",
@@ -268,6 +271,18 @@ WATCH_TABS = [
         "name_col":    3,
         "skip_rows":   1,
     },
+    # BST TPA — Declan's share of the main bailiff form (Hub rota; TrustLink source 6178), layout of BST Form Meta;
+    # Regen's WATI, bst_nc0, lead_source=bst_tpa, tagged TPA.
+    {
+        "sheet_id":    BST_SHEET_ID,
+        "tab":         "BST TPA",
+        "template":    BST_TEMPLATE,
+        "lead_source": "bst_tpa",
+        "tag":         TPA_TAG,
+        "phone_col":   6,
+        "name_col":    3,
+        "skip_rows":   1,
+    },
     # UKDT CT: Created(0) Form(1) AdName(2) FullName(3) Email(4) PhoneNumber(5)
     {
         "sheet_id":    UKDT_SHEET_ID,
@@ -320,17 +335,32 @@ WATCH_TABS = [
         "skip_rows":   1,
         "full_name":   True,
     },
-    # UKDTCTD1 (Dec) — Declan's UKDT source: Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
-    # Whole tab routes to DECLAN's WATI with ukdt_ct_w0 (NOT Regen's).
+    # UKDT CT TPA — Declan's (The Peoples Advisory) share of the MAIN council tax forms, decided lead by lead by the
+    # Hub rota (regen-ai-hub /api/rota/route; the lead zap writes his turn here instead of UKDT CT). Layout of UKDT CT.
+    # Sent from REGEN's WATI with the normal ukdt_w0 and sequence, stamped lead_source=ukdt_tpa and tagged TPA
+    # so he and Regen's people can both see whose it is. His TrustLink case (source 6177) is created by the zap.
     {
         "sheet_id":    UKDT_SHEET_ID,
-        "tab":         "UKDTCTD1 (Dec)",
-        "template":    "ukdt_ct_w0",
+        "tab":         "UKDT CT TPA",
+        "template":    UKDT_TEMPLATE,
+        "lead_source": "ukdt_tpa",
+        "tag":         TPA_TAG,
         "phone_col":   5,
         "name_col":    3,
         "skip_rows":   1,
         "full_name":   True,
-        "wati":        "declan",
+    },
+    # UKDTCTD1 (Dec) — Declan's own UKDT forms (Susan Dec video, 1% DEC NEW): Created(0) Form(1) AdName(2) FullName(3) Email(4) Phone(5)
+    # 18 Oct: these now go out from REGEN's WATI like everything else of his (his own tenant is DHD only). Susan Dec video
+    # rows are stamped ukdt_tpa + tagged TPA in _send_for_row; their TrustLink routing (his source 6190) is the zap's and unchanged.
+    {
+        "sheet_id":    UKDT_SHEET_ID,
+        "tab":         "UKDTCTD1 (Dec)",
+        "template":    UKDT_TEMPLATE,
+        "phone_col":   5,
+        "name_col":    3,
+        "skip_rows":   1,
+        "full_name":   True,
     },
     # ---- DHD (Declan) 5-campaign W0s: Created(0) FullName(1) Email(2) Number(3) ----
     {"sheet_id": "165H8GXnOUR4d1hX7vt9zhGNoX2bXVY9KTN_Xqp7g8HY", "tab": "DHD CT1",
@@ -551,12 +581,12 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     # form. Standard "UKDT 1% DEC NEW" rows (same Dec tab) and BAILIFF PHOENIX
     # now go to Regen's tenant and Regen's fu sequence.
     _form = str(row[1]).strip().lower() if len(row) > 1 and row[1] else ""
-    if tab == "UKDTCTD1 (Dec)":
-        route_declan = (_form == "ukdt ct vid susan dec")
-        if not route_declan:
-            template = UKDT_TEMPLATE      # Regen's ukdt_w0, not Declan's ukdt_ct_w0
-    else:
-        route_declan = (tab_cfg.get("wati") == "declan")
+    # 18/10: Declan's own tenant is for DHD only. His Susan Dec video leads go from Regen's WATI, marked TPA
+    # (lead_source ukdt_tpa + tag), the same as his rota share; nothing on the Dec tab routes to his tenant any more.
+    tpa_row = (tab == "UKDTCTD1 (Dec)" and _form == "ukdt ct vid susan dec")
+    if tpa_row:
+        tab_cfg = dict(tab_cfg, lead_source="ukdt_tpa", tag=TPA_TAG)
+    route_declan = (tab_cfg.get("wati") == "declan")
     if route_declan:
         if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
             log.error(f"Declan-routed lead {raw_phone} ({tab}) but Declan WATI env not set — SKIPPING (not sending via Regen)")
@@ -654,6 +684,11 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     status = send_w0(raw_phone, first_name, template)
     if status == "ok" and brand_source:
         set_lead_attributes_retry(raw_phone, brand_source)
+    if status == "ok" and tab_cfg.get("tag"):
+        try:
+            tag_regen_conversation(raw_phone, tab_cfg["tag"])
+        except Exception as _e:
+            log.warning("regen-tag: %s" % _e)
     if status == "ok" and service:
         lead_source = LEAD_SOURCE_MAP.get(template, template.replace("_w0", "")).upper()
         append_w0_tracking_row(service, raw_phone, first_name, lead_source, "w0 sent")
@@ -1860,6 +1895,24 @@ def tag_declan_conversation(raw_phone, tag):
         log.info("dec-tag: %s -> %s" % (phone, tag))
         return True
     log.warning("dec-tag: %s -> %s FAILED http %s %s" % (phone, tag, r.status_code, r.text[:120]))
+    return False
+
+
+def tag_regen_conversation(raw_phone, tag):
+    """Regen tenant: POST /api/ext/v3/conversations/{phone}/tags {tag_name}. Idempotent; the tag must already exist
+    in WATI (create it once under Settings > Tags) — a missing tag is logged, never fatal, and lead_source still marks the lead."""
+    if not tag or not WATI_API_URL or not WATI_TOKEN:
+        return False
+    base = WATI_API_URL.rstrip("/").rsplit("/", 1)[0]      # v3 has no tenant id in the path
+    phone = format_phone(raw_phone)
+    r = requests.post(base + "/api/ext/v3/conversations/%s/tags" % phone,
+                      headers={"Authorization": "Bearer " + WATI_TOKEN,
+                               "Content-Type": "application/json", "accept": "application/json"},
+                      json={"tag_name": tag}, timeout=20)
+    if r.status_code == 200:
+        log.info("regen-tag: %s -> %s" % (phone, tag))
+        return True
+    log.warning("regen-tag: %s -> %s FAILED http %s %s" % (phone, tag, r.status_code, r.text[:120]))
     return False
 
 
