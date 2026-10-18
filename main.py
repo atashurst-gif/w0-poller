@@ -2111,8 +2111,8 @@ def tag_regen_conversation(raw_phone, tag, _variant=False):
         return False
     base = WATI_API_URL.rstrip("/").rsplit("/", 1)[0]      # v3 has no tenant id in the path
     phone = format_phone(raw_phone)
-    # WATI documents the phone form with its "+" (+447...); the bare form answered 200 on 18 Oct but no chip showed in the inbox
-    r = requests.post(base + "/api/ext/v3/conversations/%s/tags" % ("+" + phone),
+    # bare 447... (the "+" form is refused: "Target +447... is not valid", 18 Oct)
+    r = requests.post(base + "/api/ext/v3/conversations/%s/tags" % phone,
                       headers={"Authorization": "Bearer " + WATI_TOKEN,
                                "Content-Type": "application/json", "accept": "application/json"},
                       json={"tag_name": tag}, timeout=20)
