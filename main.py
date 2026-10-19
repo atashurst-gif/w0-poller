@@ -925,34 +925,38 @@ def _mirror_key(r):
     return (_phone_key(r[3]), r[0].strip(), r[6].strip().upper())      # number + day booked + platform: one row per booking
 
 
+# what his team writes that comes back into our Apps 2.0 row (while ours is blank): Answered, Status, Notes, CBNA1-5 / Response1-5
+_MIRROR_BACK_COLS = [(9, "J"), (10, "K"), (11, "L")] + [(c, chr(65 + c)) for c in range(12, 22)]
+
+
 def mirror_tpa_callbacks(svc) -> int:
     if not TPA_MIRROR_ENABLED or not TPA_CB_SHEET_ID:
         return 0
-    apps = _sheet_get(svc, CBS_APPS2_SHEET_ID, "'Apps 2.0'!A:L")
+    apps = _sheet_get(svc, CBS_APPS2_SHEET_ID, "'Apps 2.0'!A:V")
     if len(apps) < 2:
         return 0
     try:
         since = datetime.datetime.strptime(TPA_MIRROR_FROM, "%Y-%m-%d").date()
     except ValueError:
         since = None
-    tpa_rows = [(i, (r + [""] * 12)[:12]) for i, r in enumerate(apps[1:], start=2)
+    tpa_rows = [(i, (r + [""] * 22)[:22]) for i, r in enumerate(apps[1:], start=2)
                 if (r + [""] * 6)[5].strip().upper() == TPA_TAG.upper() and _phone_key((r + [""] * 4)[3])
                 and (since is None or ((_dmy(r[0]) or since) >= since))]
     if not tpa_rows:
         return 0
-    mine = svc.spreadsheets().values().get(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A:L" % TPA_CB_TAB).execute().get("values", [])
+    mine = svc.spreadsheets().values().get(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A:V" % TPA_CB_TAB).execute().get("values", [])
     have = {}
     for j, r in enumerate(mine[1:], start=2):
-        have[_mirror_key(r)] = (j, (r + [""] * 12)[:12])
+        have[_mirror_key(r)] = (j, (r + [""] * 22)[:22])
     new, back = [], []
     for i, r in tpa_rows:
         k = _mirror_key(r)
         if k not in have:
-            new.append(r)
+            new.append(r[:12])
             log.info("tpa-mirror: Apps 2.0 row %d (%s %s) -> %s" % (i, r[7], r[8], TPA_CB_TAB))
             continue
         j, theirs = have[k]
-        for col, letter in ((9, "J"), (10, "K"), (11, "L")):      # Answered / Status / Notes: theirs fills our blank
+        for col, letter in _MIRROR_BACK_COLS:      # theirs fills our blank
             if theirs[col].strip() and not r[col].strip():
                 back.append({"range": "'Apps 2.0'!%s%d" % (letter, i), "values": [[theirs[col]]]})
     if new:
