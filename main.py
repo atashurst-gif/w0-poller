@@ -1206,7 +1206,7 @@ def _cbna_parse_stamp(cell):
         return 0, None
     step = int(m.group(1))
     try:
-        dt = datetime.datetime.strptime(m.group(2).strip(), CBNA_STAMP_FMT).replace(tzinfo=UK_TZ)
+        dt = datetime.datetime.strptime(re.sub(r"\s*FAILED.*$", "", m.group(2).strip()), CBNA_STAMP_FMT).replace(tzinfo=UK_TZ)
     except Exception:
         dt = None
     return step, dt
@@ -1889,6 +1889,124 @@ def _send_reminder(phone, first_name, cfg, api_url, token) -> str:
     except Exception as e:
         log.warning("reminder: send failed for %s: %s" % (formatted, e))
         return "retry"
+
+
+# ── delivery check (Aaron, 19 Oct) ───────────────────────────────────────────
+# A WATI send that is accepted can still fail on WhatsApp ("Message undeliverable"). Every few minutes the
+# stamps written today (30-min reminder, CBNA 1-5) are checked against WATI's message status; a failed one
+# gets " FAILED" added, so agents know to phone instead. Declan's TPA sheet gets the reminder result too.
+DELIVERY_CHECK_S = int(os.getenv("DELIVERY_CHECK_S", "300"))
+_delivery_last = 0.0
+_delivery_done = set()      # (sheet, cell, stamp) settled: delivered or marked failed
+
+
+def _wati_items(phone, tenant, cache):
+    k = (tenant, phone)
+    if k in cache:
+        return cache[k]
+    base, tok = (WATI_API_URL_DECLAN, WATI_TOKEN_DECLAN) if tenant == "declan" else (WATI_API_URL, WATI_TOKEN)
+    items = []
+    try:
+        r = requests.get("%s/api/v1/getMessages/%s?pageSize=40&pageNumber=1" % (base, phone),
+                         headers={"Authorization": "Bearer " + tok, "accept": "application/json"}, timeout=20)
+        items = r.json().get("messages", {}).get("items", []) or []
+    except Exception as e:
+        log.warning("delivery: getMessages %s failed: %s" % (phone[-4:], e))
+        items = None
+    cache[k] = items
+    return items
+
+
+def _send_status(items, when):
+    """Status of our template message sent around `when` (UK time): 'failed', 'ok', or None (not settled/not found)."""
+    best = None
+    for i in items or []:
+        if i.get("owner") is False or i.get("eventType") not in ("broadcastMessage", "message"):
+            continue
+        try:
+            dt = datetime.datetime.strptime(str(i.get("created", ""))[:19], "%Y-%m-%dT%H:%M:%S") \
+                .replace(tzinfo=datetime.timezone.utc).astimezone(UK_TZ)
+        except Exception:
+            continue
+        if -180 <= (dt - when).total_seconds() <= 300:
+            st = str(i.get("statusString") or "").upper()
+            if st == "FAILED":
+                return "failed"
+            if st in ("DELIVERED", "READ", "REPLIED"):
+                best = "ok"
+    return best
+
+
+def _stamp_when(cell):
+    m = re.search(r"(\d{2}/\d{2}/\d{4} \d{2}:\d{2})", cell or "")
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(m.group(1), "%d/%m/%Y %H:%M").replace(tzinfo=UK_TZ)
+    except Exception:
+        return None
+
+
+def _check_cells(svc, sheet_id, tab, rng, phone_col, cols, tenant, cache, now):
+    rows = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range="'%s'!%s" % (tab, rng)).execute().get("values", [])
+    writes, failed = [], []
+    for ri, r in enumerate(rows[1:], start=2):
+        g = lambda n: str(r[n]).strip() if n < len(r) else ""
+        phone = format_phone(g(phone_col)) if g(phone_col) else ""
+        if not phone or not is_valid_phone(phone):
+            continue
+        for c in cols:
+            cell = g(c)
+            if not cell or "FAILED" in cell.upper():
+                continue
+            when = _stamp_when(cell)
+            key = (sheet_id, tab, ri, c, cell)
+            if when is None or key in _delivery_done or (now - when).total_seconds() > 2 * 86400 or (now - when).total_seconds() < 60:
+                continue
+            st = _send_status(_wati_items(phone, tenant, cache), when)
+            if st == "failed":
+                writes.append({"range": "'%s'!%s%d" % (tab, _col_letter(c + 1), ri), "values": [[cell + " FAILED"]]})
+                failed.append((ri, c, phone))
+                _delivery_done.add(key)
+                r.extend([""] * (c + 1 - len(r)))
+                r[c] = cell + " FAILED"
+            elif st == "ok" or (now - when).total_seconds() > 3600:
+                _delivery_done.add(key)
+    if writes:
+        svc.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body={"valueInputOption": "RAW", "data": writes}).execute()
+        for ri, c, ph in failed:
+            log.warning("delivery: %s row %d col %s FAILED on WhatsApp (…%s)" % (tab, ri, _col_letter(c + 1), ph[-4:]))
+    return rows
+
+
+def check_deliveries(svc) -> None:
+    global _delivery_last
+    if time.time() - _delivery_last < DELIVERY_CHECK_S:
+        return
+    _delivery_last = time.time()
+    now = datetime.datetime.now(UK_TZ)
+    cache = {}
+    cb = [12, 14, 16, 18, 20]                           # CBNA1-5 (M, O, Q, S, U)
+    apps = _check_cells(svc, APPS2_SHEET_ID, APPS2_TAB, "A:W", 3, cb + [22], "regen", cache, now)
+    tpa_id = os.getenv("TPA_CB_SHEET_ID", "1-Yf4qroZNCj7T2eg08maSb3b74kMj-z-AYlUwceK0tw")
+    tpa_tab = os.getenv("TPA_CB_TAB", "Sheet1")
+    tpa = _check_cells(svc, tpa_id, tpa_tab, "A:W", 3, cb, "regen", cache, now)
+    if WATI_API_URL_DECLAN and WATI_TOKEN_DECLAN:
+        _check_cells(svc, DECLAN_CB_SHEET_ID, "CALLBACKS", "A:I", 3, [8], "declan", cache, now)
+    # Declan's TPA sheet: show the 30-min reminder result (sent / FAILED) from Apps 2.0 on the same booking
+    key = lambda r: (format_phone(r[3]) if len(r) > 3 and r[3] else "", r[7].strip() if len(r) > 7 else "", r[8].strip() if len(r) > 8 else "")
+    rem = {}
+    for r in apps[1:]:
+        if len(r) > 22 and str(r[22]).strip() and len(r) > 5 and str(r[5]).strip() == TPA_TAG:
+            rem[key(r)] = str(r[22]).strip()
+    for ri, r in enumerate(tpa[1:], start=2):
+        v = rem.get(key(r))
+        if v is None:
+            continue
+        cur = str(r[22]).strip() if len(r) > 22 else ""
+        if cur != v:
+            svc.spreadsheets().values().update(spreadsheetId=tpa_id, range="'%s'!W%d" % (tpa_tab, ri),
+                                               valueInputOption="RAW", body={"values": [[v]]}).execute()
 
 
 def send_callback_reminders(service) -> int:
@@ -2638,6 +2756,10 @@ def main():
             retry_failed_dhd_w0(service)
             if os.getenv("REMINDER_ENABLED", "0") == "1":
                 send_callback_reminders(service)
+            try:
+                check_deliveries(service)
+            except Exception as _e:
+                log.warning("delivery: %s" % _e)
             # retired Aug 2026 - Josh works in Apps 2.0: purge_josh_from_apps2(service)
             ping()  # healthy cycle — Sheets read OK, no auth failure
             if total_fired:
