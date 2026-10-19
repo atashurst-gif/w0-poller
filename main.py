@@ -1771,9 +1771,11 @@ REMINDER_SHEETS = [
      "answered": 9, "stamp": 22, "stamp_col": "W",
      "template": os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins"),
      "param": "first_name", "wati": "regen"},
+    # 19 Oct: the stamp now lives in his sheet (column I, "30 MIN REMINDER") - the in-memory record was wiped by every
+    # restart, and three deploys inside one reminder window sent the same client three reminders that morning.
     {"label": "declan", "sheet_id": DECLAN_CB_SHEET_ID, "tab": "CALLBACKS",
-     "rng": "A:H", "name": 0, "phone": 3, "appt": 5, "time": 4,
-     "answered": 6, "stamp": None, "stamp_col": None,
+     "rng": "A:I", "name": 0, "phone": 3, "appt": 5, "time": 4,
+     "answered": 6, "stamp": 8, "stamp_col": "I",
      "template": os.getenv("DECLAN_REMINDER_TEMPLATE", "30min_reminder"),
      "param": None, "wati": "declan"},
 ]
