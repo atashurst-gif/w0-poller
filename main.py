@@ -2286,6 +2286,8 @@ def sync_cbs_today():
     # 19 Oct (Aaron): tomorrow's callbacks are listed underneath, below a "TOMORROW" marker row. Everything from the marker
     # down is a preview rewritten from Apps 2.0; everything above it is today's working list, handled exactly as before.
     _m = next((i for i, c in enumerate(cur) if c[0].strip().upper().startswith(CBS_TOMORROW_MARK)), None)
+    while _m and not any(x.strip() for x in cur[_m - 1]):   # the blank gap row(s) above the marker belong to the preview
+        _m -= 1
     tail_old = cur[_m:] if _m is not None else []
     cur = cur[:_m] if _m is not None else cur
 
@@ -2371,22 +2373,26 @@ def _cbs_tomorrow(svc, gid, rows, now, today_len, tail_old):
     later = datetime.datetime(day.year, day.month, day.day, tzinfo=UK_TZ)
     pick.sort(key=lambda r: _cbs_sort_dt(r, later))
     marker = [CBS_TOMORROW_MARK + " - " + day.strftime("%A %d/%m/%Y") + " (preview: work these on the day)"] + [""] * 11
-    want = [marker] + pick
+    want = [[""] * 12, marker] + pick       # a clear blank gap row, then the marker
     old = [(c + [""] * 12)[:12] for c in tail_old]
     if old[:len(want)] == want and not any(any(x.strip() for x in c) for c in old[len(want):]):
         return
-    start = CBS_TODAY_FIRST_ROW + today_len            # sheet row of the marker
+    start = CBS_TODAY_FIRST_ROW + today_len + 1        # sheet row of the marker (one blank gap row above it)
     if CBS_TODAY_DRY_RUN:
         log.info("cbs-tomorrow: [DRY RUN] would write %d row(s) for %s at row %d" % (len(pick), day, start))
         return
     span = max(len(want), len(old))
     svc.spreadsheets().values().batchClear(spreadsheetId=CBS_APPS2_SHEET_ID, body={
-        "ranges": ["'%s'!A%d:L%d" % (CBS_TODAY_TAB, start, start + span)]}).execute()
+        "ranges": ["'%s'!A%d:L%d" % (CBS_TODAY_TAB, start - 1, start - 1 + span)]}).execute()
     svc.spreadsheets().values().update(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                       range="'%s'!A%d" % (CBS_TODAY_TAB, start),
+                                       range="'%s'!A%d" % (CBS_TODAY_TAB, start - 1),
                                        valueInputOption="RAW", body={"values": want}).execute()
     grey = {"red": 0.93, "green": 0.93, "blue": 0.93}
     svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": start - 2, "endRowIndex": start - 1,
+                                  "startColumnIndex": 0, "endColumnIndex": 12},
+                        "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
+                        "fields": "userEnteredFormat.backgroundColor"}},
         {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": start - 1, "endRowIndex": start,
                                   "startColumnIndex": 0, "endColumnIndex": 12},
                         "cell": {"userEnteredFormat": {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.85, "green": 0.85, "blue": 0.85}}},
