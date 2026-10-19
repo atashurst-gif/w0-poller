@@ -885,6 +885,73 @@ def ensure_rota_tags():
     return done
 
 
+# ── Declan's (TPA) callbacks, mirrored into his own sheet (Aaron, 19 Oct 08:08) ──
+# He has no access to Regen's Arkle sheet, so every Apps 2.0 row whose ReGen Handler is TPA is copied (columns A-L) into the
+# TPA REGEN CB SHEET, once. His team works there: Answered No runs the same CBNA chase from Regen's WATI (CBNA_SHEETS below),
+# and whatever they put in Answered / Status / Notes is copied back into the Apps 2.0 row while that row's cell is still blank.
+TPA_CB_SHEET_ID = os.getenv("TPA_CB_SHEET_ID", "1-Yf4qroZNCj7T2eg08maSb3b74kMj-z-AYlUwceK0tw")
+TPA_CB_TAB      = os.getenv("TPA_CB_TAB", "Sheet1")
+TPA_MIRROR_ENABLED = os.getenv("TPA_MIRROR_ENABLED", "1") == "1"
+TPA_MIRROR_FROM = os.getenv("TPA_MIRROR_FROM", "2026-10-18")     # Apps 2.0 rows booked (column A) from this UK date
+
+
+def _dmy(v):
+    """Apps 2.0 dates are dd/mm/yyyy."""
+    t = str(v or "").strip()[:10]
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(t, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _mirror_key(r):
+    r = (r + [""] * 12)[:12]
+    return (_phone_key(r[3]), r[0].strip(), r[6].strip().upper())      # number + day booked + platform: one row per booking
+
+
+def mirror_tpa_callbacks(svc) -> int:
+    if not TPA_MIRROR_ENABLED or not TPA_CB_SHEET_ID:
+        return 0
+    apps = svc.spreadsheets().values().get(spreadsheetId=CBS_APPS2_SHEET_ID, range="'Apps 2.0'!A:L").execute().get("values", [])
+    if len(apps) < 2:
+        return 0
+    try:
+        since = datetime.datetime.strptime(TPA_MIRROR_FROM, "%Y-%m-%d").date()
+    except ValueError:
+        since = None
+    tpa_rows = [(i, (r + [""] * 12)[:12]) for i, r in enumerate(apps[1:], start=2)
+                if (r + [""] * 6)[5].strip().upper() == TPA_TAG.upper() and _phone_key((r + [""] * 4)[3])
+                and (since is None or ((_dmy(r[0]) or since) >= since))]
+    if not tpa_rows:
+        return 0
+    mine = svc.spreadsheets().values().get(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A:L" % TPA_CB_TAB).execute().get("values", [])
+    have = {}
+    for j, r in enumerate(mine[1:], start=2):
+        have[_mirror_key(r)] = (j, (r + [""] * 12)[:12])
+    new, back = [], []
+    for i, r in tpa_rows:
+        k = _mirror_key(r)
+        if k not in have:
+            new.append(r)
+            log.info("tpa-mirror: Apps 2.0 row %d (%s %s) -> %s" % (i, r[7], r[8], TPA_CB_TAB))
+            continue
+        j, theirs = have[k]
+        for col, letter in ((9, "J"), (10, "K"), (11, "L")):      # Answered / Status / Notes: theirs fills our blank
+            if theirs[col].strip() and not r[col].strip():
+                back.append({"range": "'Apps 2.0'!%s%d" % (letter, i), "values": [[theirs[col]]]})
+    if new:
+        svc.spreadsheets().values().append(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A1" % TPA_CB_TAB,
+                                           valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                                           body={"values": new}).execute()
+    if back:
+        svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                                body={"valueInputOption": "RAW", "data": back}).execute()
+        log.info("tpa-mirror: %d outcome cell(s) copied back to Apps 2.0" % len(back))
+    return len(new)
+
+
 def fill_callback_handlers(svc):
     if not HANDLER_FILL_ENABLED or not ROTA_BY_PHONE:
         return 0
@@ -1187,6 +1254,16 @@ CBNA_SHEETS = [
         "steps": {1: 12, 2: 14, 3: 16, 4: 18, 5: 20},
         "resps": {1: 13, 2: 15, 3: 17, 4: 19},
         "use_cutoff": True,
+    },
+    {   # Declan's mirrored callbacks (TPA REGEN CB SHEET, same layout): Answered No -> the same chase, from Regen's WATI
+        "name": "tpa",
+        "sheet_id": os.getenv("TPA_CB_SHEET_ID", "1-Yf4qroZNCj7T2eg08maSb3b74kMj-z-AYlUwceK0tw"),
+        "tab": os.getenv("TPA_CB_TAB", "Sheet1"),
+        "rng": "A:U",
+        "answered": 9, "name_col": 2, "phone_col": 3, "campaign_col": 4,
+        "steps": {1: 12, 2: 14, 3: 16, 4: 18, 5: 20},
+        "resps": {1: 13, 2: 15, 3: 17, 4: 19},
+        "use_cutoff": False,
     },
 ]
 
@@ -2436,6 +2513,10 @@ def main():
                 ensure_rota_tags()
             except Exception as _e:
                 log.warning("rota-tag: %s" % _e)
+            try:
+                mirror_tpa_callbacks(service)
+            except Exception as _e:
+                log.warning("tpa-mirror: %s" % _e)
             sync_callback_set(service)
             sync_cbna(service)
             # retired Aug 2026 - Josh works in Apps 2.0: sync_josh_bookings(service)
