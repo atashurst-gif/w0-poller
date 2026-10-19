@@ -1965,7 +1965,7 @@ def _check_cells(svc, sheet_id, tab, rng, phone_col, cols, tenant, cache, now):
                 continue
             st = _send_status(_wati_items(phone, tenant, cache), when)
             if st == "failed":
-                writes.append({"range": "'%s'!%s%d" % (tab, _col_letter(c + 1), ri), "values": [[cell + " FAILED"]]})
+                writes.append({"range": "'%s'!%s%d" % (tab, _col_letter(c), ri), "values": [[cell + " FAILED"]]})   # _col_letter is 0-based (0 -> A)
                 failed.append((ri, c, phone))
                 _delivery_done.add(key)
                 r.extend([""] * (c + 1 - len(r)))
@@ -1975,7 +1975,7 @@ def _check_cells(svc, sheet_id, tab, rng, phone_col, cols, tenant, cache, now):
     if writes:
         svc.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body={"valueInputOption": "RAW", "data": writes}).execute()
         for ri, c, ph in failed:
-            log.warning("delivery: %s row %d col %s FAILED on WhatsApp (…%s)" % (tab, ri, _col_letter(c + 1), ph[-4:]))
+            log.warning("delivery: %s row %d col %s FAILED on WhatsApp (…%s)" % (tab, ri, _col_letter(c), ph[-4:]))
     return rows
 
 
