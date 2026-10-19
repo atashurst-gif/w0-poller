@@ -859,6 +859,8 @@ def _sheet_get(svc, sheet_id: str, rng: str, ttl: float = 50.0) -> list:
 def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
     """Fill column F (ReGen Handler) where it is blank on WATI-booked rows (Platform starts WATI) whose number we know."""
     rows = _sheet_get(svc, CBS_APPS2_SHEET_ID, "'%s'!A:L" % tab)[first_row - 1:]
+    _m = next((i for i, c in enumerate(rows) if c and str(c[0]).strip().upper().startswith("TOMORROW")), None)
+    rows = rows[:_m] if _m is not None else rows      # CB'S TODAY: not the tomorrow preview
     data = []
     for i, r in enumerate(rows):
         r = (r + [""] * 12)[:12]
@@ -2281,6 +2283,11 @@ def sync_cbs_today():
         spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
     cur = [(c + [""] * 12)[:12] for c in cur]
     gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_TODAY_TAB)
+    # 19 Oct (Aaron): tomorrow's callbacks are listed underneath, below a "TOMORROW" marker row. Everything from the marker
+    # down is a preview rewritten from Apps 2.0; everything above it is today's working list, handled exactly as before.
+    _m = next((i for i, c in enumerate(cur) if c[0].strip().upper().startswith(CBS_TOMORROW_MARK)), None)
+    tail_old = cur[_m:] if _m is not None else []
+    cur = cur[:_m] if _m is not None else cur
 
     # ── day rollover: drop rows whose Appointment is not today ─────────
     stale = [i for i, c in enumerate(cur)
@@ -2313,8 +2320,6 @@ def sync_cbs_today():
     missing = [(dt, r) for dt, r in todays if _cbs_key(r) not in have]
     seen_keys = set(); missing = [(dt, r) for dt, r in missing
                                   if not (_cbs_key(r) in seen_keys or seen_keys.add(_cbs_key(r)))]
-    if not missing:
-        return
     for dt, r in missing:
         pos = 0
         while pos < len(cur) and (not cur[pos][3].strip() or _cbs_sort_dt(cur[pos], now) <= dt):
@@ -2328,6 +2333,13 @@ def sync_cbs_today():
                 {"insertDimension": {"range": {"sheetId": gid, "dimension": "ROWS",
                                                "startIndex": rownum - 1, "endIndex": rownum},
                                      "inheritFromBefore": pos > 0}}]}).execute()
+            if pos == len(cur):   # inserted just above the tomorrow marker: clear the preview styling it may have inherited
+                svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
+                    {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": rownum - 1, "endRowIndex": rownum,
+                                              "startColumnIndex": 0, "endColumnIndex": 12},
+                                    "cell": {"userEnteredFormat": {"textFormat": {"bold": False, "foregroundColor": {"red": 0, "green": 0, "blue": 0}},
+                                                                   "backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
+                                    "fields": "userEnteredFormat(textFormat.bold,textFormat.foregroundColor,backgroundColor)"}}]}).execute()
             svc.spreadsheets().values().update(
                 spreadsheetId=CBS_APPS2_SHEET_ID,
                 range="'" + CBS_TODAY_TAB + "'!A%d" % rownum,
@@ -2335,6 +2347,56 @@ def sync_cbs_today():
             log.info("cbs-today: inserted %s | %s | %s at row %d" % (r[8], r[2][:20], r[3], rownum))
         cur.insert(pos, r)
         have.add(_cbs_key(r))
+    try:
+        _cbs_tomorrow(svc, gid, rows, now, len(cur), tail_old)
+    except Exception as e:
+        log.warning("cbs-tomorrow: %s" % e)
+
+
+CBS_TOMORROW_MARK = "TOMORROW"
+
+
+def _cbs_tomorrow(svc, gid, rows, now, today_len, tail_old):
+    """Rewrite the preview block under today's list: a marker row, then the next day's callbacks in time order (Saturday
+    shows Monday's if Sunday has none). Only written when it changed."""
+    day = now.date() + datetime.timedelta(days=1)
+    pick = []
+    for k in range(3):
+        d = day + datetime.timedelta(days=k)
+        ds = d.strftime("%d/%m/%Y")
+        pick = [(c + [""] * 12)[:12] for c in rows[1:] if (c + [""] * 12)[7].strip() == ds and (c + [""] * 12)[3].strip()]
+        if pick or d.weekday() != 6:     # stop at the first day with callbacks, or at a non-Sunday
+            day = d
+            break
+    later = datetime.datetime(day.year, day.month, day.day, tzinfo=UK_TZ)
+    pick.sort(key=lambda r: _cbs_sort_dt(r, later))
+    marker = [CBS_TOMORROW_MARK + " - " + day.strftime("%A %d/%m/%Y") + " (preview: work these on the day)"] + [""] * 11
+    want = [marker] + pick
+    old = [(c + [""] * 12)[:12] for c in tail_old]
+    if old[:len(want)] == want and not any(any(x.strip() for x in c) for c in old[len(want):]):
+        return
+    start = CBS_TODAY_FIRST_ROW + today_len            # sheet row of the marker
+    if CBS_TODAY_DRY_RUN:
+        log.info("cbs-tomorrow: [DRY RUN] would write %d row(s) for %s at row %d" % (len(pick), day, start))
+        return
+    span = max(len(want), len(old))
+    svc.spreadsheets().values().batchClear(spreadsheetId=CBS_APPS2_SHEET_ID, body={
+        "ranges": ["'%s'!A%d:L%d" % (CBS_TODAY_TAB, start, start + span)]}).execute()
+    svc.spreadsheets().values().update(spreadsheetId=CBS_APPS2_SHEET_ID,
+                                       range="'%s'!A%d" % (CBS_TODAY_TAB, start),
+                                       valueInputOption="RAW", body={"values": want}).execute()
+    grey = {"red": 0.93, "green": 0.93, "blue": 0.93}
+    svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": start - 1, "endRowIndex": start,
+                                  "startColumnIndex": 0, "endColumnIndex": 12},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.85, "green": 0.85, "blue": 0.85}}},
+                        "fields": "userEnteredFormat(textFormat.bold,backgroundColor)"}},
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": start, "endRowIndex": start + max(len(pick), 1) + max(0, len(old) - len(want)),
+                                  "startColumnIndex": 0, "endColumnIndex": 12},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": False, "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}}, "backgroundColor": grey}},
+                        "fields": "userEnteredFormat(textFormat.bold,textFormat.foregroundColor,backgroundColor)"}},
+    ]}).execute()
+    log.info("cbs-tomorrow: %d callback(s) for %s listed under today's" % (len(pick), day.strftime("%d/%m")))
 
 
 def _cbs_parse_date(v):
