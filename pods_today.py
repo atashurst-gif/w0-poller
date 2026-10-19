@@ -26,7 +26,7 @@ or removing a column there does not break anything. The only write to PODs is
 the "Missed Call 1" column (added at the end if it is not there).
 
 Grid columns: B time, C TL Reference, D Name, E Number, F Creditor Name,
-G creditor Number, H Answered, I Notes.
+G creditor Number, H ReGen Handler (who booked the POD, from the PODs tab), I Answered, J Notes.
 
 Standalone (from ~/Desktop/w0-poller):
   python3 pods_today.py          # preview: what it would do, writes and sends nothing
@@ -74,6 +74,17 @@ YES_NO_RULE = {"condition": {"type": "ONE_OF_LIST", "values": [
         "backgroundColorStyle": {"rgbColor": {"red": 1, "green": 0.8117647, "blue": 0.7882353}},
         "foregroundColorStyle": {"rgbColor": {"red": 0.69411767, "green": 0.007843138, "blue": 0.007843138}}}}]},
     "showCustomUi": True, "strict": True}
+
+# ReGen Handler on the grids: the same agent chips as the PODs tab's ReGen Handler column
+def _chip(name, bg, fg):
+    return {"userEnteredValue": name, "dropdownStyle": {"backgroundColorStyle": {"rgbColor": bg}, "foregroundColorStyle": {"rgbColor": fg}}}
+HANDLER_RULE = {"condition": {"type": "ONE_OF_LIST", "values": [
+    _chip("Leah", {"red": 0.9411765, "green": 0.6745098, "blue": 0.85490197}, {"red": 0.06666667, "green": 0.4509804, "blue": 0.29411766}),
+    _chip("Josh", {"red": 0.69411767, "green": 0.007843138, "blue": 0.007843138}, {"red": 1, "green": 0.8117647, "blue": 0.7882353}),
+    _chip("Claire", {"red": 0.3529412, "green": 0.19607843, "blue": 0.5254902}, {"red": 0.8980392, "green": 0.8117647, "blue": 0.9490196}),
+    _chip("Bianca", {"red": 0.7490196, "green": 0.88235295, "blue": 0.9647059}, {"red": 0.039215688, "green": 0.3254902, "blue": 0.65882355})]},
+    "showCustomUi": True, "strict": False}
+HANDLER_C, ANSWER_C, LAST_C = 7, 8, 10          # 0-based column index of H, I; grid runs C..J
 
 _last_tick = 0.0
 _warned = {}
@@ -189,7 +200,7 @@ def lunch_rows(sec):
 
 def _cells_range(gid, first, last):
     return {"sheetId": gid, "startRowIndex": first - 1, "endRowIndex": last,
-            "startColumnIndex": 2, "endColumnIndex": 9}
+            "startColumnIndex": 2, "endColumnIndex": LAST_C}
 
 
 def wa_number(raw):
@@ -222,7 +233,7 @@ def _col(idx):
 def read(svc):
     res = svc.spreadsheets().values().batchGet(
         spreadsheetId=SHEET_ID,
-        ranges=["'%s'!A:Z" % SRC_TAB, "'%s'!A1:I500" % DST_TAB]).execute()
+        ranges=["'%s'!A:Z" % SRC_TAB, "'%s'!A1:J500" % DST_TAB]).execute()
     vr = res.get("valueRanges", [])
     return vr[0].get("values", []), vr[1].get("values", [])
 
@@ -237,7 +248,7 @@ def src_columns(header):
         return None
     c = {"tl": first("tl reference"), "name": first("name"), "phone": first("number"),
          "time": first("time"), "creditor": first("creditor name"), "notes": first("notes"),
-         "missed": first(MISSED_HEADER.lower())}
+         "missed": first(MISSED_HEADER.lower()), "handler": first("regen handler")}
     if c["time"] is not None:
         c["date"] = next((i for i in range(c["time"] - 1, -1, -1) if h[i] == "date"), None)
     if c["creditor"] is not None:
@@ -263,10 +274,10 @@ def pods_by_date(src):
         d, t = norm_date(g(r, "date")), norm_time(g(r, "time"))
         if not d or not t or not (g(r, "phone") or g(r, "name")):
             continue
-        vals = [g(r, "tl"), g(r, "name"), g(r, "phone"), g(r, "creditor"), g(r, "cred_phone"), "", g(r, "notes")]
+        vals = [g(r, "tl"), g(r, "name"), g(r, "phone"), g(r, "creditor"), g(r, "cred_phone"), g(r, "handler"), "", g(r, "notes")]
         out.setdefault(d, []).append({
             "t": t, "d": d, "row": i, "vals": vals, "key": pod_key(g(r, "phone"), g(r, "tl"), g(r, "name"), t),
-            "name": g(r, "name"), "phone": g(r, "phone"), "creditor": g(r, "creditor"),
+            "name": g(r, "name"), "phone": g(r, "phone"), "creditor": g(r, "creditor"), "handler": g(r, "handler"),
             "missed": "" if cols.get("missed_new") else g(r, "missed")})
     for d in out:
         out[d].sort(key=lambda p: p["t"])
@@ -285,11 +296,11 @@ def sections(grid):
             continue
         rows, j = [], i + 2
         while j < len(grid):
-            rr = (list(grid[j]) + [""] * 9)[:9]
+            rr = (list(grid[j]) + [""] * 10)[:10]
             t = norm_time(rr[1])
             if not t:
                 break
-            rows.append({"r": j + 1, "t": t, "cells": [str(x).strip() for x in rr[2:9]]})
+            rows.append({"r": j + 1, "t": t, "cells": [str(x).strip() for x in rr[2:10]]})
             j += 1
         secs[label] = {"label_row": i + 1, "date": norm_date(row[3] if len(row) > 3 else ""), "rows": rows}
     return secs
@@ -350,15 +361,21 @@ class Writer:
 
     def white(self, r):
         return {"repeatCell": {"range": {"sheetId": self.gid, "startRowIndex": r - 1, "endRowIndex": r,
-                                         "startColumnIndex": 2, "endColumnIndex": 9},
+                                         "startColumnIndex": 2, "endColumnIndex": LAST_C},
                                "cell": {"userEnteredFormat": {"backgroundColor": WHITE}},
                                "fields": "userEnteredFormat.backgroundColor"}}
 
     def dropdown(self, r):
-        """Yes/No chips on the grid's Answered cell (H)."""
+        """Yes/No chips on the grid's Answered cell (I)."""
         return {"setDataValidation": {"range": {"sheetId": self.gid, "startRowIndex": r - 1, "endRowIndex": r,
-                                                "startColumnIndex": 7, "endColumnIndex": 8},
+                                                "startColumnIndex": ANSWER_C, "endColumnIndex": ANSWER_C + 1},
                                       "rule": YES_NO_RULE}}
+
+    def handler(self, r):
+        """Agent chips on the grid's ReGen Handler cell (H) - both grids."""
+        return {"setDataValidation": {"range": {"sheetId": self.gid, "startRowIndex": r - 1, "endRowIndex": r,
+                                                "startColumnIndex": HANDLER_C, "endColumnIndex": HANDLER_C + 1},
+                                      "rule": HANDLER_RULE}}
 
 
 def src_values(svc, a1, rows, dry, cols):
@@ -398,8 +415,8 @@ def reset(w, sec, merged, name, target):
     lunch_nums = {x["r"] for x in lunch}
     whole = bool(lunch) and all(merged.get(r) == (min(lunch_nums), max(lunch_nums)) for r in lunch_nums)
     plain = [row for row in sec["rows"] if row["r"] not in merged or (row["r"] in lunch_nums and not whole)]
-    w.clear(["C%d:I%d" % (row["r"], row["r"]) for row in plain if any(row["cells"])])
-    reqs = [w.white(row["r"]) for row in plain]
+    w.clear(["C%d:J%d" % (row["r"], row["r"]) for row in plain if any(row["cells"])])
+    reqs = [w.white(row["r"]) for row in plain] + [w.handler(row["r"]) for row in plain if row["r"] not in lunch_nums]
     if name == "TODAY":
         reqs += [w.dropdown(row["r"]) for row in plain if row["r"] not in lunch_nums]
     if lunch and not whole:                              # a POD split the lunch block - put it back
@@ -418,22 +435,22 @@ def place(w, sec, merged, pod, name="TODAY"):
     """Put one POD on the grid. Returns (description, structural_change)."""
     for row in sec["rows"]:
         if row["t"] == pod["t"] and row["r"] not in merged and not any(row["cells"]):
-            w.values("C%d:I%d" % (row["r"], row["r"]), [pod["vals"]])
+            w.values("C%d:J%d" % (row["r"], row["r"]), [pod["vals"]])
             row["cells"] = list(pod["vals"])
             return "row %d" % row["r"], False
     solo = next((x for x in sec["rows"] if x["t"] == pod["t"] and x["r"] not in merged
                  and x["cells"][0].upper() == "LUNCH" and not any(x["cells"][1:])), None)
     if solo is not None:                                 # what is left of lunch at that time: the POD takes it
-        reqs = [w.white(solo["r"])] + ([w.dropdown(solo["r"])] if name == "TODAY" else [])
+        reqs = [w.white(solo["r"]), w.handler(solo["r"])] + ([w.dropdown(solo["r"])] if name == "TODAY" else [])
         w.structure(reqs)
-        w.values("C%d:I%d" % (solo["r"], solo["r"]), [pod["vals"]])
+        w.values("C%d:J%d" % (solo["r"], solo["r"]), [pod["vals"]])
         solo["cells"] = list(pod["vals"])
         return "lunch row %d" % solo["r"], False
     slot = next((x for x in sec["rows"] if x["t"] == pod["t"] and x["r"] in merged), None)
     if slot is not None:                                 # booked in the lunch block: give it that row
         first, last = merged[slot["r"]]
         rest = [r for r in range(first, last + 1) if r != slot["r"]]
-        reqs = [{"unmergeCells": {"range": _cells_range(w.gid, first, last)}}, w.white(slot["r"])]
+        reqs = [{"unmergeCells": {"range": _cells_range(w.gid, first, last)}}, w.white(slot["r"]), w.handler(slot["r"])]
         runs, run = [], []
         for r in rest:                                   # what is left of the lunch block stays merged
             if run and r != run[-1] + 1:
@@ -446,7 +463,7 @@ def place(w, sec, merged, pod, name="TODAY"):
         if name == "TODAY":
             reqs.append(w.dropdown(slot["r"]))
         w.structure(reqs)
-        w.values("C%d:I%d" % (slot["r"], slot["r"]), [pod["vals"]])
+        w.values("C%d:J%d" % (slot["r"], slot["r"]), [pod["vals"]])
         for rn in runs:
             w.values("C%d" % rn[0], [["LUNCH"]])
         return "lunch row %d (lunch block split)" % slot["r"], True
@@ -465,8 +482,8 @@ def place(w, sec, merged, pod, name="TODAY"):
     w.structure([{"insertDimension": {"range": {"sheetId": w.gid, "dimension": "ROWS",
                                                 "startIndex": at - 1, "endIndex": at},
                                       "inheritFromBefore": inherit}},
-                 w.white(at)] + ([w.dropdown(at)] if name == "TODAY" else []))
-    w.values("B%d:I%d" % (at, at), [[serial_time(pod["t"])] + pod["vals"]])
+                 w.white(at), w.handler(at)] + ([w.dropdown(at)] if name == "TODAY" else []))
+    w.values("B%d:J%d" % (at, at), [[serial_time(pod["t"])] + pod["vals"]])
     return "new row %d" % at, True
 
 
@@ -550,7 +567,7 @@ def chase_missed(svc, info, secs, pods, cols, now, dry):
         by_who.setdefault(p["key"][0], []).append(p)
     due, unmatched = [], []
     for row in secs["TODAY"]["rows"]:
-        if not any(row["cells"]) or norm_answer(row["cells"][5]) != "No":
+        if not any(row["cells"]) or norm_answer(row["cells"][6]) != "No":
             continue
         ps = by_who.get(who_of(row["cells"]))
         if not ps:
@@ -620,7 +637,10 @@ def run(svc, dry_run=False, now=None):
         if not _dropdowns_done:                           # Yes/No chips on every grid row, once per start
             info = meta(svc)
             w = Writer(svc, info["gid"], dry_run)
-            w.structure([w.dropdown(r["r"]) for r in secs["TODAY"]["rows"] if r["r"] not in info["merged"]])
+            w.structure([w.dropdown(r["r"]) for r in secs["TODAY"]["rows"] if r["r"] not in info["merged"]]
+                        + [w.handler(r["r"]) for n in SECTIONS for r in secs[n]["rows"] if r["r"] not in info["merged"]])
+            for n in SECTIONS:                            # the column heading on both grids
+                w.values("H%d" % (secs[n]["label_row"] + 1), [["ReGen Handler"]])
             _dropdowns_done = not dry_run
         for name in SECTIONS:
             sec, target = secs[name], targets[name]
@@ -658,6 +678,20 @@ def run(svc, dry_run=False, now=None):
                 break
         if again and not dry_run:
             continue
+        # who booked it: fill a blank ReGen Handler on the grids from the PODs tab
+        for name in SECTIONS:
+            sec = secs[name]
+            for r in sec["rows"]:
+                if not any(r["cells"]) or r["cells"][0].upper() == "LUNCH" or r["cells"][5]:
+                    continue
+                cand = [p for p in pods.get(sec["date"], []) if p["key"][0] == who_of(r["cells"]) and p.get("handler")]
+                hit = next((p for p in cand if p["t"] == r["t"]), cand[0] if cand else None)
+                if hit:
+                    info = info or meta(svc)
+                    w = w or Writer(svc, info["gid"], dry_run)
+                    w.values("H%d" % r["r"], [[hit["handler"]]])
+                    r["cells"][5] = hit["handler"]
+                    done.append("pods-today: %s %s handler -> %s" % (name, r["t"], hit["handler"]))
         # grids are current: send any missed-POD messages for Nos on the TODAY grid
         try:
             info = info or meta(svc)
