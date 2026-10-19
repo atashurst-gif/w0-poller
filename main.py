@@ -952,7 +952,10 @@ def mirror_tpa_callbacks(svc) -> int:
     for i, r in tpa_rows:
         k = _mirror_key(r)
         if k not in have:
-            new.append(r[:12])
+            row = r[:12]
+            camp = row[4].strip().lower()
+            row[4] = "BST" if camp.startswith("bst") else ("UKDT" if camp.startswith("ukdt") else row[4])   # his sheet's Campaign dropdown
+            new.append(row)
             log.info("tpa-mirror: Apps 2.0 row %d (%s %s) -> %s" % (i, r[7], r[8], TPA_CB_TAB))
             continue
         j, theirs = have[k]
