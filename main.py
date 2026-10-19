@@ -726,6 +726,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     if status == "ok" and tab_cfg.get("tag"):
         try:
             _ROTA_TAG_DONE[_phone_key(raw_phone)] = (tab_cfg["tag"], tag_regen_conversation(raw_phone, tab_cfg["tag"]), time.time())
+            set_owner_attribute(raw_phone, tab_cfg["tag"])
         except Exception as _e:
             log.warning("regen-tag: %s" % _e)
     # whose enquiry it is (Hub rota), from the trailing column the lead zaps / websites write: tag the chat with that name
@@ -735,6 +736,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
         try:
             _t = ROTA_TAG_MAP.get(rota_name.lower(), rota_name)
             _ROTA_TAG_DONE[_phone_key(raw_phone)] = (_t, tag_regen_conversation(raw_phone, _t), time.time())
+            set_owner_attribute(raw_phone, _t)
         except Exception as _e:
             log.warning("rota-tag: %s" % _e)
     if status == "ok" and service:
@@ -889,6 +891,8 @@ def ensure_rota_tags():
             continue
         try:
             ok = tag_regen_conversation(phone, tag)
+            if ok:
+                ok = set_owner_attribute(phone, tag) or ok
         except Exception as e:
             log.warning("rota-tag: %s" % e)
             ok = False
@@ -2204,6 +2208,24 @@ def tag_declan_conversation(raw_phone, tag):
         log.info("dec-tag: %s -> %s" % (phone, tag))
         return True
     log.warning("dec-tag: %s -> %s FAILED http %s %s" % (phone, tag, r.status_code, r.text[:120]))
+    return False
+
+
+OWNER_ATTRIBUTE = os.getenv("OWNER_ATTRIBUTE", "owner")   # contact attribute WATI's inbox can filter on (Filter -> Attribute)
+
+
+def set_owner_attribute(raw_phone, owner) -> bool:
+    """Regen tenant: contact attribute `owner` = Josh / Leah / Noor / TPA. This tenant's inbox filters by contact attributes
+    (not conversation tags), so this is what lets an agent list only their own chats, and it shows in the contact panel."""
+    if not owner or not WATI_API_URL or not WATI_TOKEN:
+        return False
+    phone = format_phone(raw_phone)
+    r = requests.post(WATI_API_URL + "/api/v1/updateContactAttributes/" + phone,
+                      headers={"Authorization": "Bearer " + WATI_TOKEN, "Content-Type": "application/json"},
+                      json={"customParams": [{"name": OWNER_ATTRIBUTE, "value": owner}]}, timeout=20)
+    if r.status_code in (200, 201) and '"result":true' in r.text.replace(" ", ""):
+        return True
+    log.warning("owner-attr: %s -> %s FAILED http %s %s" % (phone, owner, r.status_code, r.text[:140]))
     return False
 
 
