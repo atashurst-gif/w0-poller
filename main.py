@@ -839,10 +839,24 @@ def _index_rota_owners(tab_cfg: dict, data_rows: list, last_n: int = 400):
             ROTA_TAG_TODO[key] = (TPA_TAG if name == HANDLER_NAME_MAP["declan"] else ROTA_TAG_MAP.get(name.lower(), name), str(row[phone_col]).strip())
 
 
+# One read of a range per cycle, shared by the passes below (Sheets allows 60 reads a minute per user; the Apps 2.0 sheet was
+# being read four or five times a cycle once the handler fill, the TPA mirror and CB'S TODAY all wanted it - 429s on 19 Oct).
+_SHEET_CACHE = {}
+
+
+def _sheet_get(svc, sheet_id: str, rng: str, ttl: float = 50.0) -> list:
+    k = (sheet_id, rng)
+    hit = _SHEET_CACHE.get(k)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    rows = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute().get("values", [])
+    _SHEET_CACHE[k] = (time.time(), rows)
+    return rows
+
+
 def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
     """Fill column F (ReGen Handler) where it is blank on WATI-booked rows (Platform starts WATI) whose number we know."""
-    rng = "'%s'!A%d:L" % (tab, first_row)
-    rows = svc.spreadsheets().values().get(spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
+    rows = _sheet_get(svc, CBS_APPS2_SHEET_ID, "'%s'!A:L" % tab)[first_row - 1:]
     data = []
     for i, r in enumerate(rows):
         r = (r + [""] * 12)[:12]
@@ -914,7 +928,7 @@ def _mirror_key(r):
 def mirror_tpa_callbacks(svc) -> int:
     if not TPA_MIRROR_ENABLED or not TPA_CB_SHEET_ID:
         return 0
-    apps = svc.spreadsheets().values().get(spreadsheetId=CBS_APPS2_SHEET_ID, range="'Apps 2.0'!A:L").execute().get("values", [])
+    apps = _sheet_get(svc, CBS_APPS2_SHEET_ID, "'Apps 2.0'!A:L")
     if len(apps) < 2:
         return 0
     try:
@@ -1254,6 +1268,7 @@ CBNA_SHEETS = [
         "steps": {1: 12, 2: 14, 3: 16, 4: 18, 5: 20},
         "resps": {1: 13, 2: 15, 3: 17, 4: 19},
         "use_cutoff": True,
+        "skip_handler": TPA_TAG,      # his rows are chased from his own sheet (below), never twice
     },
     {   # Declan's mirrored callbacks (TPA REGEN CB SHEET, same layout): Answered No -> the same chase, from Regen's WATI
         "name": "tpa",
@@ -1290,6 +1305,8 @@ def _cbna_for_sheet(service, cfg) -> int:
             return r[idx].strip() if idx < len(r) else ""
 
         if g(cfg["answered"]).lower() != "no":
+            continue
+        if cfg.get("skip_handler") and g(5).upper() == str(cfg["skip_handler"]).upper():
             continue
 
         if cfg["use_cutoff"]:
@@ -2216,8 +2233,7 @@ def sync_cbs_today():
     now   = datetime.datetime.now(UK_TZ)
     today = now.strftime("%d/%m/%Y")
     svc   = get_sheets_service()
-    rows  = svc.spreadsheets().values().get(
-        spreadsheetId=CBS_APPS2_SHEET_ID, range="'Apps 2.0'!A:L").execute().get("values", [])
+    rows  = _sheet_get(svc, CBS_APPS2_SHEET_ID, "'Apps 2.0'!A:L")
 
     todays = []
     for r in rows[1:]:
