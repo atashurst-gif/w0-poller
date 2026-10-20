@@ -693,20 +693,26 @@ def run(svc, dry_run=False, now=None):
                 break
         if again and not dry_run:
             continue
-        # who booked it: fill a blank ReGen Handler on the grids from the PODs tab
+        # Aaron, 20 Oct (Josh): details added on the PODs tab after the POD reached the grid (creditor, numbers,
+        # handler, notes) are copied onto the grid row while that cell is still blank; nothing typed there is overwritten
+        FILL = [(1, "D"), (2, "E"), (3, "F"), (4, "G"), (5, "H"), (7, "J")]
         for name in SECTIONS:
             sec = secs[name]
             for r in sec["rows"]:
-                if not any(r["cells"]) or r["cells"][0].upper() == "LUNCH" or r["cells"][5]:
+                if not any(r["cells"]) or r["cells"][0].upper() == "LUNCH":
                     continue
-                cand = [p for p in pods.get(sec["date"], []) if p["key"][0] == who_of(r["cells"]) and p.get("handler")]
+                cand = [p for p in pods.get(sec["date"], []) if p["key"][0] == who_of(r["cells"])]
                 hit = next((p for p in cand if p["t"] == r["t"]), cand[0] if cand else None)
-                if hit:
-                    info = info or meta(svc)
-                    w = w or Writer(svc, info["gid"], dry_run)
-                    w.values("H%d" % r["r"], [[hit["handler"]]])
-                    r["cells"][5] = hit["handler"]
-                    done.append("pods-today: %s %s handler -> %s" % (name, r["t"], hit["handler"]))
+                if not hit:
+                    continue
+                for i, col in FILL:
+                    v = hit["vals"][i]
+                    if v and not r["cells"][i]:
+                        info = info or meta(svc)
+                        w = w or Writer(svc, info["gid"], dry_run)
+                        w.values("%s%d" % (col, r["r"]), [[v]])
+                        r["cells"][i] = v
+                        done.append("pods-today: %s %s %s filled from PODs" % (name, r["t"], col))
         # grids are current: send any missed-POD messages for Nos on the TODAY grid
         try:
             info = info or meta(svc)
