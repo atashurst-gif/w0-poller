@@ -2710,6 +2710,11 @@ def main():
     log.info(f"Watching {len(WATCH_TABS)} tabs | Poll interval: {POLL_INTERVAL}s")
 
     seen = load_seen()
+    try:
+        import owner_backfill
+        owner_backfill.start(SEEN_FILE)
+    except Exception as _e:
+        log.warning("owner-backfill: not started: %s" % _e)
 
     while True:
         try:
