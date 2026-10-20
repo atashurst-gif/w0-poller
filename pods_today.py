@@ -176,8 +176,11 @@ def next_working_day(d):
 
 
 def pod_key(number, tl, name, t):
+    # Aaron, 20 Oct: the TL reference first. A row typed on the grid without its number used to count as a
+    # different person from the same POD on the PODs tab (which has the number), so it was added twice.
+    ref = "".join(c for c in str(tl) if c.isdigit())
     digits = "".join(c for c in str(number) if c.isdigit())[-9:]
-    who = digits or str(tl).strip().upper() or str(name).strip().lower()
+    who = ("TL-" + ref) if len(ref) >= 5 else (digits or str(name).strip().lower())
     return (who, t)
 
 
@@ -299,6 +302,13 @@ def sections(grid):
             rr = (list(grid[j]) + [""] * 10)[:10]
             t = norm_time(rr[1])
             if not t:
+                # a filled row whose time was cleared: keep reading (it used to end the grid there, so later
+                # PODs were missed and added again) and give it back the time of the row above
+                if rows and any(str(x).strip() for x in rr[2:10]):
+                    secs.setdefault("_fix", []).append((j + 1, rows[-1]["t"]))
+                    rows.append({"r": j + 1, "t": rows[-1]["t"], "cells": [str(x).strip() for x in rr[2:10]]})
+                    j += 1
+                    continue
                 break
             rows.append({"r": j + 1, "t": t, "cells": [str(x).strip() for x in rr[2:10]]})
             j += 1
@@ -634,6 +644,11 @@ def run(svc, dry_run=False, now=None):
             raise RuntimeError("could not find the TODAY and TOMORROW grids on %s - nothing written" % DST_TAB)
         pods, cols = pods_by_date(src)
         info, w, again = None, None, False
+        for row, t in secs.pop("_fix", []):                # put the time back on a filled row whose time was cleared
+            info = info or meta(svc)
+            w = w or Writer(svc, info["gid"], dry_run)
+            w.values("B%d" % row, [[serial_time(t)]])
+            done.append("pods-today: row %d had no time, set to %s" % (row, t))
         if not _dropdowns_done:                           # Yes/No chips on every grid row, once per start
             info = meta(svc)
             w = Writer(svc, info["gid"], dry_run)
