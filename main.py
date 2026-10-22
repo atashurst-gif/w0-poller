@@ -1790,7 +1790,9 @@ REMINDER_SHEETS = [
      "rng": "A:W", "name": 2, "phone": 3, "appt": 7, "time": 8,
      "answered": 9, "stamp": 22, "stamp_col": "W",
      "template": os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins"),
-     "param": "first_name", "wati": "regen", "skip_known": True},
+     "param": "first_name", "wati": "regen", "skip_known": True,
+     # DHD enquiries are reminded from Declan's WATI with his template; UKDT / BST from Regen's
+     "campaign": 4, "declan_prefix": "DHD"},
 ]
 
 
@@ -1864,15 +1866,22 @@ def _reminders_for_sheet(service, cfg) -> int:
             log.info("reminder[%s] [DRY RUN] would send %s to %s (%s) for %s %s"
                      % (cfg["label"], cfg["template"], ph, first, appt, tm))
             continue
-        st = _send_reminder(ph, first, cfg, api_url, token)
+        rcfg, r_api, r_tok = cfg, api_url, token
+        if cfg.get("campaign") is not None and g(cfg["campaign"]).upper().startswith(cfg.get("declan_prefix", "DHD")):
+            if not WATI_API_URL_DECLAN or not WATI_TOKEN_DECLAN:
+                log.warning("reminder[%s]: %s is a DHD enquiry but Declan's WATI is not set - not sent" % (cfg["label"], ph))
+                continue
+            rcfg = dict(cfg, template=os.getenv("DECLAN_REMINDER_TEMPLATE", "30min_reminder"), param=None)
+            r_api, r_tok = WATI_API_URL_DECLAN, WATI_TOKEN_DECLAN
+        st = _send_reminder(ph, first, rcfg, r_api, r_tok)
         if st == "ok":
             if cfg["stamp"] is None:
                 _mark_reminded(ph, now)
             if cfg["stamp_col"]:
                 stamps.append({"range": "'" + cfg["tab"] + "'" + "!" + cfg["stamp_col"] + str(i),
                                "values": [[now.strftime("%d/%m/%Y %H:%M")]]})
-            log.info("reminder[%s]: sent to %s (%s) for %s %s"
-                     % (cfg["label"], ph, first, appt, tm))
+            log.info("reminder[%s]: sent %s to %s (%s) for %s %s"
+                     % (cfg["label"], rcfg["template"], ph, first, appt, tm))
             sent += 1
         else:
             log.warning("reminder[%s]: send to %s returned %s" % (cfg["label"], ph, st))
