@@ -1784,6 +1784,13 @@ REMINDER_SHEETS = [
      "answered": 6, "stamp": 8, "stamp_col": "I",
      "template": os.getenv("DECLAN_REMINDER_TEMPLATE", "30min_reminder"),
      "param": None, "wati": "declan"},
+    # 22 Oct: callbacks Declan's team types straight into the TPA sheet (not via Apps 2.0) had no reminder. Rows that came
+    # from Apps 2.0 are left to the Apps 2.0 reminder (skip_known), so nobody gets two.
+    {"label": "tpa", "sheet_id": TPA_CB_SHEET_ID, "tab": TPA_CB_TAB,
+     "rng": "A:W", "name": 2, "phone": 3, "appt": 7, "time": 8,
+     "answered": 9, "stamp": 22, "stamp_col": "W",
+     "template": os.getenv("REMINDER_TEMPLATE", "cb_reminder_30_mins"),
+     "param": "first_name", "wati": "regen", "skip_known": True},
 ]
 
 
@@ -1817,12 +1824,24 @@ def _reminders_for_sheet(service, cfg) -> int:
     if cfg["wati"] == "declan" and (not api_url or not token):
         return 0
 
+    known = set()
+    if cfg.get("skip_known"):                  # already reminded from Apps 2.0
+        try:
+            for a in _sheet_get(service, APPS2_SHEET_ID, "'%s'!A:I" % APPS2_TAB)[1:]:
+                a = (a + [""] * 9)[:9]
+                known.add((_phone_key(a[3]), a[7].strip(), a[8].strip()))
+        except Exception as e:
+            log.error("reminder[%s]: cannot read Apps 2.0: %s" % (cfg["label"], e))
+            return 0
+
     sent = 0
     stamps = []
     for i, r in enumerate(rows[1:], start=2):
         def g(n):
             return r[n].strip() if n < len(r) else ""
         if cfg["stamp"] is not None and g(cfg["stamp"]):
+            continue
+        if known and (_phone_key(g(cfg["phone"])), g(cfg["appt"]), g(cfg["time"])) in known:
             continue
         if g(cfg["answered"]) and g(cfg["answered"]) != "-":
             continue
