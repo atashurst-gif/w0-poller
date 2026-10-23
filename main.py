@@ -1599,6 +1599,11 @@ def purge_josh_from_apps2(service) -> int:
 
 DHD_RETRY_DRY_RUN = os.getenv("DHD_RETRY_DRY_RUN", "1") == "1"
 DHD_RETRY_WINDOW_HOURS = int(os.getenv("DHD_RETRY_WINDOW_HOURS", "6"))
+DHD_RETRY_INTERVAL_MIN = int(os.getenv("DHD_RETRY_INTERVAL_MIN", "15"))
+DHD_RETRY_MAX_ATTEMPTS = int(os.getenv("DHD_RETRY_MAX_ATTEMPTS", "4"))
+# phone -> [attempts, last_check_ts]; phones that need no retry are kept in _DHD_RETRY_SETTLED
+_DHD_RETRY_STATE = {}
+_DHD_RETRY_SETTLED = set()
 
 _DHD_TEMPLATE_FOR_SOURCE = {
     "dhd_ct": "dhd_ct_instant",
@@ -1652,7 +1657,7 @@ def retry_failed_dhd_w0(service) -> int:
         camp, status, phone = g(4), g(5).lower(), g(3)
         if not phone:
             continue
-        if status == "w0 resent":
+        if status in ("w0 resent", "w0 retry gave up"):
             done.add(phone)
             continue
         if not camp.lower().startswith("dhd_"):
@@ -1666,11 +1671,23 @@ def retry_failed_dhd_w0(service) -> int:
             continue
         cands.append((phone, g(2), camp.lower(), sent))
 
-    cands = [c for c in cands if c[0] not in done]
+    nowts = time.time()
+    cands = [c for c in cands if c[0] not in done and c[0] not in _DHD_RETRY_SETTLED]
+    # throttle: each number is checked at most once per DHD_RETRY_INTERVAL_MIN
+    cands = [c for c in cands
+             if nowts - _DHD_RETRY_STATE.get(c[0], [0, 0])[1] >= DHD_RETRY_INTERVAL_MIN * 60]
     if not cands:
         return 0
 
-    failed = [c for c in cands if _wati_status(c[0]) == "FAILED"]
+    failed = []
+    for c in cands:
+        st = _wati_status(c[0])
+        if st == "FAILED":
+            failed.append(c)
+        elif st in ("DELIVERED", "READ", "REPLIED", "Delivered", "Read", "Replied"):
+            _DHD_RETRY_SETTLED.add(c[0])
+        else:
+            _DHD_RETRY_STATE.setdefault(c[0], [0, 0])[1] = nowts
     if not failed:
         return 0
 
@@ -1708,8 +1725,21 @@ def retry_failed_dhd_w0(service) -> int:
         matches = [w for w, n in ctwa if n and (n == key or n.startswith(key) or key.startswith(n))]
         matches = [w for w in matches if w != phone]
         if len(matches) != 1:
-            log.warning("dhd-retry: %s (%s) FAILED - %d candidate(s), skipping"
-                        % (phone, fname, len(matches)))
+            stt = _DHD_RETRY_STATE.setdefault(phone, [0, 0])
+            stt[0] += 1
+            stt[1] = nowts
+            if stt[0] >= DHD_RETRY_MAX_ATTEMPTS:
+                _DHD_RETRY_SETTLED.add(phone)
+                try:
+                    append_w0_tracking_row(service, phone, fname, camp.upper(), "w0 retry gave up")
+                except Exception as e:
+                    log.error("dhd-retry: could not record give-up for %s: %s" % (phone, e))
+                log.warning("dhd-retry: %s (%s) FAILED - %d candidate(s) after %d checks, giving up"
+                            % (phone, fname, len(matches), stt[0]))
+            else:
+                log.warning("dhd-retry: %s (%s) FAILED - %d candidate(s), check %d/%d, next in %dmin"
+                            % (phone, fname, len(matches), stt[0], DHD_RETRY_MAX_ATTEMPTS,
+                               DHD_RETRY_INTERVAL_MIN))
             continue
         target = matches[0]
         tmpl = _DHD_TEMPLATE_FOR_SOURCE.get(camp)
