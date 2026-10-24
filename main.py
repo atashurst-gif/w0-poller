@@ -94,6 +94,7 @@ ROTA_TAG_MAP = {"declan": TPA_TAG}
 # handler of any WATI-booked row in Apps 2.0 and CB'S TODAY whose number it recognises. Never overwrites a handler already set.
 HANDLER_FILL_ENABLED = os.getenv("HANDLER_FILL_ENABLED", "1") == "1"
 HANDLER_FILL_DRY_RUN = os.getenv("HANDLER_FILL_DRY_RUN", "0") == "1"
+SUNDAY_HANDLER = os.getenv("SUNDAY_HANDLER", "Noor")   # ReGen Handler for every WATI-booked Sunday callback
 HANDLER_NAME_MAP = {"declan": TPA_TAG}       # Declan's rows are written as the TPA tag name (Aaron, 18 Oct 18:37: "TPA"); others as they come: Josh, Leah, Noor
 ROTA_BY_PHONE = {}                            # last 9 digits of the number -> handler name, rebuilt from the enquiry tabs every cycle
 # WATI tags are applied when the W0 goes out; this makes sure every recent chat carries its tag even if the tag did not exist
@@ -868,7 +869,11 @@ def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
             continue                                  # handler already there - never overwritten
         if not r[6].strip().upper().startswith("WATI"):
             continue                                  # only callbacks that came through WATI
-        name = ROTA_BY_PHONE.get(_phone_key(r[3]))
+        _ad = _appt_dt(r[7], r[8] or "12:00")
+        if _ad is not None and _ad.weekday() == 6 and SUNDAY_HANDLER:
+            name = SUNDAY_HANDLER                     # 24 Oct: Sunday callbacks (2:30-5:30pm) are all Noor's
+        else:
+            name = ROTA_BY_PHONE.get(_phone_key(r[3]))
         if not name:
             continue
         rownum = first_row + i
