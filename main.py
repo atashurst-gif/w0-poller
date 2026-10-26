@@ -2052,7 +2052,7 @@ def check_deliveries(svc) -> None:
     cb = [12, 14, 16, 18, 20]                           # CBNA1-5 (M, O, Q, S, U)
     apps = _check_cells(svc, APPS2_SHEET_ID, APPS2_TAB, "A:W", 3, cb + [22], "regen", cache, now)
     tpa_id = os.getenv("TPA_CB_SHEET_ID", "1-Yf4qroZNCj7T2eg08maSb3b74kMj-z-AYlUwceK0tw")
-    tpa_tab = os.getenv("TPA_CB_TAB", "Sheet1")
+    tpa_tab = TPA_CB_TAB
     tpa = _check_cells(svc, tpa_id, tpa_tab, "A:W", 3, cb, "regen", cache, now)
     if WATI_API_URL_DECLAN and WATI_TOKEN_DECLAN:
         _check_cells(svc, DECLAN_CB_SHEET_ID, "CALLBACKS", "A:I", 3, [8], "declan", cache, now)
@@ -2767,6 +2767,32 @@ def ensure_cb_dashboard(svc):
     log.info("cb-dashboard: built %s" % CBS_DASH_TAB)
 
 
+_TPA_TAB_AT = 0.0
+def refresh_tpa_tab(svc):
+    """26 Oct: the TPA sheet's callbacks tab was renamed (Sheet1 -> CB) and every TPA reminder, CBNA chase and
+    mirror failed for two hours. Follow the tab by its id (the first tab, sheetId 0) instead of its name, so a
+    rename can't stop them again. Checked every 10 minutes; falls back to whatever name worked last."""
+    global TPA_CB_TAB, _TPA_TAB_AT
+    if time.time() - _TPA_TAB_AT < 600:
+        return
+    _TPA_TAB_AT = time.time()
+    try:
+        want = int(os.getenv("TPA_CB_SHEET_GID", "0"))
+        meta = svc.spreadsheets().get(spreadsheetId=TPA_CB_SHEET_ID, fields="sheets.properties(sheetId,title)").execute()
+        title = next((s["properties"]["title"] for s in meta.get("sheets", []) if s["properties"].get("sheetId") == want), None)
+        if not title or title == TPA_CB_TAB:
+            return
+        log.warning("tpa-tab: callbacks tab is now called %r (was %r) - following it" % (title, TPA_CB_TAB))
+        old_name = TPA_CB_TAB
+        TPA_CB_TAB = title
+        for lst in (CBNA_SHEETS, REMINDER_SHEETS):
+            for cfg in lst:
+                if cfg.get("sheet_id") == TPA_CB_SHEET_ID and cfg.get("tab") == old_name:
+                    cfg["tab"] = title
+    except Exception as e:
+        log.warning("tpa-tab: could not check the tab name: %s" % e)
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -2783,6 +2809,7 @@ def main():
         try:
             service = get_sheets_service()
             ensure_w0_tracking_sheet(service)
+            refresh_tpa_tab(service)
             total_fired = 0
             try:
                 sync_cbs_today()
