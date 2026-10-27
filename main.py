@@ -742,6 +742,10 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
             log.warning("rota-tag: %s" % _e)
     if status == "ok" and service:
         lead_source = LEAD_SOURCE_MAP.get(template, template.replace("_w0", "")).upper()
+        # 27/10: Declan's council tax / bailiff leads on Regen's WATI (Susan Dec video, UKDT CT TPA, BST TPA) are logged
+        # "UKDT TPA" / "BST TPA" so the sequence gives them his DHD timing and wording. Regen's own and GDS are unchanged.
+        if tab_cfg.get("lead_source") in ("ukdt_tpa", "bst_tpa") and lead_source in ("UKDT", "BST"):
+            lead_source += " TPA"
         append_w0_tracking_row(service, raw_phone, first_name, lead_source, "w0 sent")
     return status
 
