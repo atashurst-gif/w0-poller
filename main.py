@@ -2797,6 +2797,45 @@ def refresh_tpa_tab(svc):
         log.warning("tpa-tab: could not check the tab name: %s" % e)
 
 
+def tpa_relabel_once(svc):
+    """27 Oct, one-off: Declan's leads already in W0 Tracking from before the TPA label (Susan Dec video, UKDT CT TPA,
+    BST TPA, last 14 days) get UKDT TPA / BST TPA so they move onto his DHD sequence at their next step.
+    Runs once (flag file next to the seen file); Regen's own rows are never touched."""
+    flag = os.path.join(os.path.dirname(SEEN_FILE) or ".", "tpa_relabel.done")
+    if os.path.exists(flag):
+        return
+    def k(v):
+        d = "".join(c for c in str(v or "") if c.isdigit())
+        return d[-10:] if len(d) >= 10 else ""
+    get = lambda sid, rng: svc.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
+    ukdt = {k(r[5]) for r in get(UKDT_SHEET_ID, "'UKDT CT TPA'!A2:F") if len(r) > 5}
+    ukdt |= {k(r[5]) for r in get(UKDT_SHEET_ID, "'UKDTCTD1 (Dec)'!A2:F")
+             if len(r) > 5 and str(r[1]).strip().lower() == "ukdt ct vid susan dec"}
+    bst = {k(r[6]) for r in get(BST_SHEET_ID, "'BST TPA'!A2:G") if len(r) > 6}
+    ukdt.discard(""); bst.discard("")
+    rows = get(W0_TRACKING_SHEET_ID, "'%s'!A:F" % W0_TRACKING_TAB)
+    cutoff = datetime.datetime.now(UK_TZ).replace(tzinfo=None) - datetime.timedelta(days=14)
+    data = []
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) < 5:
+            continue
+        try:
+            when = datetime.datetime.strptime(str(r[0]).strip(), "%d/%m/%Y %H:%M")
+        except ValueError:
+            continue
+        camp = str(r[4]).strip().upper()
+        if when < cutoff or camp not in ("UKDT", "BST"):
+            continue
+        if (camp == "UKDT" and k(r[3]) in ukdt) or (camp == "BST" and k(r[3]) in bst):
+            data.append({"range": "'%s'!E%d" % (W0_TRACKING_TAB, i), "values": [[camp + " TPA"]]})
+    if data:
+        svc.spreadsheets().values().batchUpdate(spreadsheetId=W0_TRACKING_SHEET_ID,
+                                                body={"valueInputOption": "RAW", "data": data}).execute()
+    open(flag, "w").write(datetime.datetime.now(UK_TZ).isoformat())
+    log.info("tpa-relabel: %d of Declan's W0 Tracking rows (last 14 days) marked UKDT TPA / BST TPA (%d UKDT, %d BST numbers on his tabs)"
+             % (len(data), len(ukdt), len(bst)))
+
+
 def main():
     log.info("W0 Poller starting...")
     log.info(f"BST template: {BST_TEMPLATE} | UKDT template: {UKDT_TEMPLATE}")
@@ -2814,6 +2853,10 @@ def main():
             service = get_sheets_service()
             ensure_w0_tracking_sheet(service)
             refresh_tpa_tab(service)
+            try:
+                tpa_relabel_once(service)
+            except Exception as _e:
+                log.warning("tpa-relabel: %s" % _e)
             total_fired = 0
             try:
                 sync_cbs_today()
