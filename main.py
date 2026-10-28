@@ -591,6 +591,32 @@ def _extract_first_name(raw_name: str, full_name: bool) -> str:
         return (m.group(0) if m else raw_name).title()
     return raw_name.title()
 
+TPA_FIRST_TEMPLATE = {"ukdt_tpa": os.getenv("TPA_UKDT_FIRST", "ukdt_tpa_instant"),
+                      "bst_tpa": os.getenv("TPA_BST_FIRST", "bst_tpa_instant")}
+_regen_tpl = {"at": 0.0, "names": set()}
+
+
+def regen_approved_templates() -> set:
+    """Names of APPROVED templates on Regen's WATI, cached 10 min (last good answer kept on errors)."""
+    if time.time() - _regen_tpl["at"] < 600:
+        return _regen_tpl["names"]
+    names, page = set(), 1
+    try:
+        while page <= 10:
+            r = requests.get("%s/api/v1/getMessageTemplates?pageSize=100&pageNumber=%d" % (WATI_API_URL, page),
+                             headers={"Authorization": "Bearer " + WATI_TOKEN}, timeout=30)
+            items = r.json().get("messageTemplates") or []
+            names |= {str(t.get("elementName")) for t in items if str(t.get("status", "")).upper() == "APPROVED"}
+            if len(items) < 100:
+                break
+            page += 1
+        _regen_tpl.update(at=time.time(), names=names)
+    except Exception as e:
+        log.warning("regen templates: %s - keeping last list" % e)
+        _regen_tpl["at"] = time.time() - 540
+    return _regen_tpl["names"]
+
+
 def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     """Resolve routing + out-of-hours for a single row and send.
        Returns send_w0 status ('ok'|'dead'|'retry') or 'skip' if the row is unsendable."""
@@ -721,7 +747,14 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
     # downstream flows/conditions always have lead_source. booking_window/booking_url
     # stay out-of-hours-only. Lowercase to match the WEEKEND FORM chatbot condition.
     brand_source = tab_cfg.get("lead_source") or LEAD_SOURCE_MAP.get(template)
-    status = send_w0(raw_phone, first_name, template)
+    # 28/10: Declan's council tax / bailiff leads (TPA) get his DHD first message, copied into Regen's WATI as
+    # ukdt_tpa_instant / bst_tpa_instant - used as soon as WATI shows it APPROVED, Regen's usual one until then.
+    send_template = template
+    if tab_cfg.get("lead_source") in ("ukdt_tpa", "bst_tpa") and template in (UKDT_TEMPLATE, BST_TEMPLATE):
+        _tpa_first = TPA_FIRST_TEMPLATE["ukdt_tpa" if template == UKDT_TEMPLATE else "bst_tpa"]
+        if _tpa_first in regen_approved_templates():
+            send_template = _tpa_first
+    status = send_w0(raw_phone, first_name, send_template)
     if status == "ok" and brand_source:
         set_lead_attributes_retry(raw_phone, brand_source)
     if status == "ok" and tab_cfg.get("tag"):
