@@ -229,14 +229,14 @@ def _verify_lead_source(phone: str, expected: str) -> bool:
 
 
 def ensure_w0_tracking_sheet(service):
-    meta = service.spreadsheets().get(spreadsheetId=W0_TRACKING_SHEET_ID).execute()
+    meta = service.spreadsheets().get(spreadsheetId=W0_TRACKING_SHEET_ID).execute(num_retries=4)
     tabs = [s['properties']['title'] for s in meta.get('sheets', [])]
     if W0_TRACKING_TAB not in tabs:
         log.info(f"Creating '{W0_TRACKING_TAB}' tab...")
         service.spreadsheets().batchUpdate(
             spreadsheetId=W0_TRACKING_SHEET_ID,
             body={"requests": [{"addSheet": {"properties": {"title": W0_TRACKING_TAB}}}]}
-        ).execute()
+        ).execute(num_retries=4)
         service.spreadsheets().values().append(
             spreadsheetId=W0_TRACKING_SHEET_ID,
             range=f"'{W0_TRACKING_TAB}'!A1",
@@ -245,7 +245,7 @@ def ensure_w0_tracking_sheet(service):
             body={"values": [[
                 "Sent At", "TL-REF", "First Name", "Phone", "Campaign", "Status"
             ]]}
-        ).execute()
+        ).execute(num_retries=4)
         log.info(f"'{W0_TRACKING_TAB}' created.")
 
 
@@ -267,7 +267,7 @@ def append_w0_tracking_row(service, phone: str, first_name: str, campaign: str, 
                 campaign,
                 status,
             ]]}
-        ).execute()
+        ).execute(num_retries=4)
         log.info(f"{formatted}: added to {W0_TRACKING_TAB} as {status} ({campaign})")
         return True
     except Exception as e:
@@ -729,7 +729,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
                         datetime.datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M"),
                         first_name or "there",
                         format_phone(raw_phone),
-                    ]]}).execute()
+                    ]]}).execute(num_retries=4)
                 upd = (res.get("updates", {}) or {}).get("updatedRange", "")
                 rownum = "".join(c for c in upd.split("!")[-1].split(":")[0] if c.isdigit())
                 if rownum:
@@ -737,7 +737,7 @@ def _send_for_row(row: list, tab_cfg: dict, service=None) -> str:
                         spreadsheetId=DECLAN_AUTOMATION_SHEET_ID,
                         range="'" + seq_tab + "'" + "!E" + rownum,
                         valueInputOption="RAW",
-                        body={"values": [["0"]]}).execute()
+                        body={"values": [["0"]]}).execute(num_retries=4)
                 else:
                     log.error("dhd-seq: could not derive row from %r, STEP not set" % upd)
                 log.info("dhd-seq: enrolled %s (%s) in %s"
@@ -905,7 +905,7 @@ def _sheet_get(svc, sheet_id: str, rng: str, ttl: float = 50.0) -> list:
     hit = _SHEET_CACHE.get(k)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
-    rows = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute().get("values", [])
+    rows = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute(num_retries=4).get("values", [])
     _SHEET_CACHE[k] = (time.time(), rows)
     return rows
 
@@ -934,7 +934,7 @@ def _fill_handlers_in(svc, tab: str, first_row: int) -> int:
         log.info("handler: %s row %d (%s %s) -> %s%s" % (tab, rownum, r[7], r[8], name, " [DRY RUN]" if HANDLER_FILL_DRY_RUN else ""))
     if data and not HANDLER_FILL_DRY_RUN:
         svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                                body={"valueInputOption": "RAW", "data": data}).execute()
+                                                body={"valueInputOption": "RAW", "data": data}).execute(num_retries=4)
     return len(data)
 
 
@@ -1008,7 +1008,7 @@ def mirror_tpa_callbacks(svc) -> int:
                 and (since is None or ((_dmy(r[0]) or since) >= since))]
     if not tpa_rows:
         return 0
-    mine = svc.spreadsheets().values().get(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A:V" % TPA_CB_TAB).execute().get("values", [])
+    mine = svc.spreadsheets().values().get(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A:V" % TPA_CB_TAB).execute(num_retries=4).get("values", [])
     have = {}
     for j, r in enumerate(mine[1:], start=2):
         have[_mirror_key(r)] = (j, (r + [""] * 22)[:22])
@@ -1029,10 +1029,10 @@ def mirror_tpa_callbacks(svc) -> int:
     if new:
         svc.spreadsheets().values().append(spreadsheetId=TPA_CB_SHEET_ID, range="'%s'!A1" % TPA_CB_TAB,
                                            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-                                           body={"values": new}).execute()
+                                           body={"values": new}).execute(num_retries=4)
     if back:
         svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                                body={"valueInputOption": "RAW", "data": back}).execute()
+                                                body={"valueInputOption": "RAW", "data": back}).execute(num_retries=4)
         log.info("tpa-mirror: %d outcome cell(s) copied back to Apps 2.0" % len(back))
     return len(new)
 
@@ -1059,7 +1059,7 @@ def poll_tab(service, tab_cfg: dict, seen: dict) -> int:
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range=f"'{tab}'!A:Z",
-        ).execute()
+        ).execute(num_retries=4)
     except Exception as e:
         log.warning(f"Could not read {tab}: {e}")
         return 0
@@ -1155,7 +1155,7 @@ def sync_callback_set(service) -> int:
     try:
         apps = service.spreadsheets().values().get(
             spreadsheetId=APPS2_SHEET_ID, range=f"'{APPS2_TAB}'!A:L"
-        ).execute().get("values", [])
+        ).execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error(f"callback-sync: cannot read Apps 2.0: {e}")
         return 0
@@ -1187,7 +1187,7 @@ def sync_callback_set(service) -> int:
     try:
         rows = service.spreadsheets().values().get(
             spreadsheetId=AUTOMATION_SHEET_ID, range="'Sheet1'!A:F"
-        ).execute().get("values", [])
+        ).execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error(f"callback-sync: cannot read Sheet1: {e}")
         return 0
@@ -1219,7 +1219,7 @@ def sync_callback_set(service) -> int:
                 range=f"'Sheet1'!F{rownum}",
                 valueInputOption="RAW",
                 body={"values": [[CALLBACK_SET_STATUS]]},
-            ).execute()
+            ).execute(num_retries=4)
             log.info(f"callback-sync: row {rownum} ({name}) -> {CALLBACK_SET_STATUS}")
             done += 1
         except Exception as e:
@@ -1360,7 +1360,7 @@ def _cbna_for_sheet(service, cfg) -> int:
     try:
         rows = service.spreadsheets().values().get(
             spreadsheetId=cfg["sheet_id"],
-            range="'" + cfg["tab"] + "'!" + cfg["rng"]).execute().get("values", [])
+            range="'" + cfg["tab"] + "'!" + cfg["rng"]).execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("%s: cannot read sheet: %s" % (tag, e))
         return 0
@@ -1438,7 +1438,7 @@ def _cbna_for_sheet(service, cfg) -> int:
                         spreadsheetId=cfg["sheet_id"],
                         range="'" + cfg["tab"] + "'!" + _col_letter(resp_col) + str(i),
                         valueInputOption="RAW",
-                        body={"values": [[stamp]]}).execute()
+                        body={"values": [[stamp]]}).execute(num_retries=4)
                     log.info("%s: row %s reply -> Response%s %s" % (tag, i, cur_step, stamp))
             continue
 
@@ -1457,7 +1457,7 @@ def _cbna_for_sheet(service, cfg) -> int:
                     spreadsheetId=cfg["sheet_id"],
                     range="'" + cfg["tab"] + "'!" + _col_letter(step_cols[step_no]) + str(i),
                     valueInputOption="RAW",
-                    body={"values": [[cell]]}).execute()
+                    body={"values": [[cell]]}).execute(num_retries=4)
             time.sleep(1)
 
     if sent_total:
@@ -1500,7 +1500,7 @@ def sync_josh_bookings(service) -> int:
     try:
         lv = service.spreadsheets().values().get(
             spreadsheetId=UKDT_SHEET_ID,
-            range="'" + JOSH_LEAD_TAB + "'!A:F").execute().get("values", [])
+            range="'" + JOSH_LEAD_TAB + "'!A:F").execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("josh-sync: cannot read lead tab: %s" % e)
         return 0
@@ -1519,10 +1519,10 @@ def sync_josh_bookings(service) -> int:
     try:
         apps = service.spreadsheets().values().get(
             spreadsheetId=APPS2_SHEET_ID,
-            range="'" + APPS2_TAB + "'!A:U").execute().get("values", [])
+            range="'" + APPS2_TAB + "'!A:U").execute(num_retries=4).get("values", [])
         cur = service.spreadsheets().values().get(
             spreadsheetId=JOSH_SHEET_ID,
-            range="'" + JOSH_TAB + "'!A:D").execute().get("values", [])
+            range="'" + JOSH_TAB + "'!A:D").execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("josh-sync: cannot read sheets: %s" % e)
         return 0
@@ -1560,7 +1560,7 @@ def sync_josh_bookings(service) -> int:
             range="'" + JOSH_TAB + "'!A:J",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": rows}).execute()
+            body={"values": rows}).execute(num_retries=4)
         for x in rows:
             log.info("josh-sync: added %s (%s) appt %s %s" % (x[2], x[3], x[6], x[7]))
     except Exception as e:
@@ -1577,7 +1577,7 @@ def purge_josh_from_apps2(service) -> int:
     Three gates: booking on/after that lead's Josh date, present in Josh's tracker,
     and untouched by Ian (no handler, no status)."""
     try:
-        meta = service.spreadsheets().get(spreadsheetId=APPS2_SHEET_ID).execute()
+        meta = service.spreadsheets().get(spreadsheetId=APPS2_SHEET_ID).execute(num_retries=4)
     except Exception as e:
         log.error("josh-purge: cannot read Apps 2.0 metadata: %s" % e)
         return 0
@@ -1592,13 +1592,13 @@ def purge_josh_from_apps2(service) -> int:
     try:
         jv = service.spreadsheets().values().get(
             spreadsheetId=UKDT_SHEET_ID,
-            range="'" + JOSH_LEAD_TAB + "'!A:F").execute().get("values", [])
+            range="'" + JOSH_LEAD_TAB + "'!A:F").execute(num_retries=4).get("values", [])
         jt = service.spreadsheets().values().get(
             spreadsheetId=JOSH_SHEET_ID,
-            range="'" + JOSH_TAB + "'!A:D").execute().get("values", [])
+            range="'" + JOSH_TAB + "'!A:D").execute(num_retries=4).get("values", [])
         apps = service.spreadsheets().values().get(
             spreadsheetId=APPS2_SHEET_ID,
-            range="'" + APPS2_TAB + "'!A:U").execute().get("values", [])
+            range="'" + APPS2_TAB + "'!A:U").execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("josh-purge: cannot read sheets: %s" % e)
         return 0
@@ -1646,7 +1646,7 @@ def purge_josh_from_apps2(service) -> int:
             for x in sorted(todel, key=lambda y: -y[0])]
     try:
         service.spreadsheets().batchUpdate(
-            spreadsheetId=APPS2_SHEET_ID, body={"requests": reqs}).execute()
+            spreadsheetId=APPS2_SHEET_ID, body={"requests": reqs}).execute(num_retries=4)
         for x in todel:
             log.info("josh-purge: removed Apps2 row %s (%s %s)" % (x[0], x[1], x[2]))
     except Exception as e:
@@ -1702,7 +1702,7 @@ def retry_failed_dhd_w0(service) -> int:
     try:
         rows = service.spreadsheets().values().get(
             spreadsheetId=W0_TRACKING_SHEET_ID,
-            range="'" + W0_TRACKING_TAB + "'" + "!A:F").execute().get("values", [])
+            range="'" + W0_TRACKING_TAB + "'" + "!A:F").execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("dhd-retry: cannot read W0 Tracking: %s" % e)
         return 0
@@ -1904,7 +1904,7 @@ def _reminders_for_sheet(service, cfg) -> int:
     try:
         rows = service.spreadsheets().values().get(
             spreadsheetId=cfg["sheet_id"],
-            range="'" + cfg["tab"] + "'" + "!" + cfg["rng"]).execute().get("values", [])
+            range="'" + cfg["tab"] + "'" + "!" + cfg["rng"]).execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("reminder[%s]: cannot read sheet: %s" % (cfg["label"], e))
         return 0
@@ -1978,7 +1978,7 @@ def _reminders_for_sheet(service, cfg) -> int:
         try:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=cfg["sheet_id"],
-                body={"valueInputOption": "RAW", "data": stamps}).execute()
+                body={"valueInputOption": "RAW", "data": stamps}).execute(num_retries=4)
         except Exception as e:
             log.error("reminder[%s]: stamp failed: %s" % (cfg["label"], e))
     return sent
@@ -2064,7 +2064,7 @@ def _stamp_when(cell):
 
 
 def _check_cells(svc, sheet_id, tab, rng, phone_col, cols, tenant, cache, now):
-    rows = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range="'%s'!%s" % (tab, rng)).execute().get("values", [])
+    rows = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range="'%s'!%s" % (tab, rng)).execute(num_retries=4).get("values", [])
     writes, failed = [], []
     for ri, r in enumerate(rows[1:], start=2):
         g = lambda n: str(r[n]).strip() if n < len(r) else ""
@@ -2089,7 +2089,7 @@ def _check_cells(svc, sheet_id, tab, rng, phone_col, cols, tenant, cache, now):
             elif st == "ok" or (now - when).total_seconds() > 3600:
                 _delivery_done.add(key)
     if writes:
-        svc.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body={"valueInputOption": "RAW", "data": writes}).execute()
+        svc.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body={"valueInputOption": "RAW", "data": writes}).execute(num_retries=4)
         for ri, c, ph in failed:
             log.warning("delivery: %s row %d col %s FAILED on WhatsApp (…%s)" % (tab, ri, _col_letter(c), ph[-4:]))
     return rows
@@ -2122,7 +2122,7 @@ def check_deliveries(svc) -> None:
         cur = str(r[22]).strip() if len(r) > 22 else ""
         if cur != v:
             svc.spreadsheets().values().update(spreadsheetId=tpa_id, range="'%s'!W%d" % (tpa_tab, ri),
-                                               valueInputOption="RAW", body={"values": [[v]]}).execute()
+                                               valueInputOption="RAW", body={"values": [[v]]}).execute(num_retries=4)
 
 
 def send_callback_reminders(service) -> int:
@@ -2138,7 +2138,7 @@ def _send_callback_reminders_legacy(service) -> int:
     try:
         rows = service.spreadsheets().values().get(
             spreadsheetId=APPS2_SHEET_ID,
-            range="'" + APPS2_TAB + "'" + "!A:W").execute().get("values", [])
+            range="'" + APPS2_TAB + "'" + "!A:W").execute(num_retries=4).get("values", [])
     except Exception as e:
         log.error("reminder: cannot read Apps 2.0: %s" % e)
         return 0
@@ -2182,7 +2182,7 @@ def _send_callback_reminders_legacy(service) -> int:
         try:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=APPS2_SHEET_ID,
-                body={"valueInputOption": "RAW", "data": stamps}).execute()
+                body={"valueInputOption": "RAW", "data": stamps}).execute(num_retries=4)
         except Exception as e:
             log.error("reminder: stamp failed: %s" % e)
     return sent
@@ -2227,7 +2227,7 @@ def _cbs_save_state(st):
 
 
 def _cbs_gid(svc, sheet_id, title):
-    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=4)
     for sh in meta["sheets"]:
         if sh["properties"]["title"] == title:
             return sh["properties"]["sheetId"]
@@ -2341,7 +2341,7 @@ def dhd_second_pass():
     svc = _dhd_second_svc
     try:
         cb = svc.spreadsheets().values().get(spreadsheetId=DECLAN_CB_SHEET_ID,
-                                             range="'CALLBACKS'!D:D").execute().get("values", [])
+                                             range="'CALLBACKS'!D:D").execute(num_retries=4).get("values", [])
         booked = {"".join(ch for ch in str(r[0]) if ch.isdigit())[-9:] for r in cb if r and str(r[0]).strip()}
     except Exception as e:
         log.warning("dhd-2nd: CALLBACKS read failed (%s) - treating nobody as booked" % e)
@@ -2352,7 +2352,7 @@ def dhd_second_pass():
     for tab in DHD_SECOND_TABS:
         try:
             rows = svc.spreadsheets().values().get(spreadsheetId=DHD_SECOND_SHEET_ID,
-                                                   range="'%s'!A:G" % tab).execute().get("values", [])
+                                                   range="'%s'!A:G" % tab).execute(num_retries=4).get("values", [])
         except Exception as e:
             log.warning("dhd-2nd: read %s failed: %s" % (tab, e))
             continue
@@ -2404,7 +2404,7 @@ def dhd_second_pass():
                 continue
             try:
                 svc.spreadsheets().values().update(spreadsheetId=DHD_SECOND_SHEET_ID, range="'%s'!G%d" % (tab, i),
-                                                   valueInputOption="RAW", body={"values": [[mark]]}).execute()
+                                                   valueInputOption="RAW", body={"values": [[mark]]}).execute(num_retries=4)
             except Exception as e:
                 log.warning("dhd-2nd: mark %s row %d failed: %s" % (tab, i, e))
 
@@ -2514,7 +2514,7 @@ def sync_cbs_today():
     rng = "'" + CBS_TODAY_TAB + "'!A%d:L" % CBS_TODAY_FIRST_ROW
 
     cur = svc.spreadsheets().values().get(
-        spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute().get("values", [])
+        spreadsheetId=CBS_APPS2_SHEET_ID, range=rng).execute(num_retries=4).get("values", [])
     cur = [(c + [""] * 12)[:12] for c in cur]
     gid = _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_TODAY_TAB)
     # 19 Oct (Aaron): tomorrow's callbacks are listed underneath, below a "TOMORROW" marker row. Everything from the marker
@@ -2536,7 +2536,7 @@ def sync_cbs_today():
                      "startIndex": CBS_TODAY_FIRST_ROW - 1 + i,
                      "endIndex": CBS_TODAY_FIRST_ROW + i}}} for i in sorted(stale, reverse=True)]
             svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                           body={"requests": reqs}).execute()
+                                           body={"requests": reqs}).execute(num_retries=4)
             log.info("cbs-today: removed %d row(s) not dated %s" % (len(stale), today))
         cur = [c for i, c in enumerate(cur) if i not in set(stale)]
 
@@ -2568,18 +2568,18 @@ def sync_cbs_today():
             svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
                 {"insertDimension": {"range": {"sheetId": gid, "dimension": "ROWS",
                                                "startIndex": rownum - 1, "endIndex": rownum},
-                                     "inheritFromBefore": pos > 0}}]}).execute()
+                                     "inheritFromBefore": pos > 0}}]}).execute(num_retries=4)
             if pos == len(cur):   # inserted just above the tomorrow marker: clear the preview styling it may have inherited
                 svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
                     {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": rownum - 1, "endRowIndex": rownum,
                                               "startColumnIndex": 0, "endColumnIndex": 12},
                                     "cell": {"userEnteredFormat": {"textFormat": {"bold": False, "foregroundColor": {"red": 0, "green": 0, "blue": 0}},
                                                                    "backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
-                                    "fields": "userEnteredFormat(textFormat.bold,textFormat.foregroundColor,backgroundColor)"}}]}).execute()
+                                    "fields": "userEnteredFormat(textFormat.bold,textFormat.foregroundColor,backgroundColor)"}}]}).execute(num_retries=4)
             svc.spreadsheets().values().update(
                 spreadsheetId=CBS_APPS2_SHEET_ID,
                 range="'" + CBS_TODAY_TAB + "'!A%d" % rownum,
-                valueInputOption="RAW", body={"values": [r]}).execute()
+                valueInputOption="RAW", body={"values": [r]}).execute(num_retries=4)
             log.info("cbs-today: inserted %s | %s | %s at row %d" % (r[8], r[2][:20], r[3], rownum))
         cur.insert(pos, r)
         have.add(_cbs_key(r))
@@ -2617,10 +2617,10 @@ def _cbs_tomorrow(svc, gid, rows, now, today_len, tail_old):
         return
     span = max(len(want), len(old))
     svc.spreadsheets().values().batchClear(spreadsheetId=CBS_APPS2_SHEET_ID, body={
-        "ranges": ["'%s'!A%d:L%d" % (CBS_TODAY_TAB, start - 1, start - 1 + span)]}).execute()
+        "ranges": ["'%s'!A%d:L%d" % (CBS_TODAY_TAB, start - 1, start - 1 + span)]}).execute(num_retries=4)
     svc.spreadsheets().values().update(spreadsheetId=CBS_APPS2_SHEET_ID,
                                        range="'%s'!A%d" % (CBS_TODAY_TAB, start - 1),
-                                       valueInputOption="RAW", body={"values": want}).execute()
+                                       valueInputOption="RAW", body={"values": want}).execute(num_retries=4)
     grey = {"red": 0.93, "green": 0.93, "blue": 0.93}
     svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
         {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": start - 2, "endRowIndex": start - 1,
@@ -2635,7 +2635,7 @@ def _cbs_tomorrow(svc, gid, rows, now, today_len, tail_old):
                                   "startColumnIndex": 0, "endColumnIndex": 12},
                         "cell": {"userEnteredFormat": {"textFormat": {"bold": False, "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}}, "backgroundColor": grey}},
                         "fields": "userEnteredFormat(textFormat.bold,textFormat.foregroundColor,backgroundColor)"}},
-    ]}).execute()
+    ]}).execute(num_retries=4)
     log.info("cbs-tomorrow: %d callback(s) for %s listed under today's" % (len(pick), day.strftime("%d/%m")))
 
 
@@ -2685,16 +2685,16 @@ def rebuild_cb_stats(svc, rows, now):
         return
     if _cbs_gid(svc, CBS_APPS2_SHEET_ID, CBS_STATS_TAB) is None:
         svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
-            {"addSheet": {"properties": {"title": CBS_STATS_TAB}}}]}).execute()
+            {"addSheet": {"properties": {"title": CBS_STATS_TAB}}}]}).execute(num_retries=4)
         log.info("cb-stats: created tab %s" % CBS_STATS_TAB)
     svc.spreadsheets().values().batchClear(spreadsheetId=CBS_APPS2_SHEET_ID, body={
-        "ranges": ["'" + CBS_STATS_TAB + "'!A:G", "'" + CBS_STATS_TAB + "'!I:J"]}).execute()
+        "ranges": ["'" + CBS_STATS_TAB + "'!A:G", "'" + CBS_STATS_TAB + "'!I:J"]}).execute(num_retries=4)
     svc.spreadsheets().values().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={
         "valueInputOption": "USER_ENTERED",
         "data": [{"range": "'" + CBS_STATS_TAB + "'!A1", "values": out},
                  {"range": "'" + CBS_STATS_TAB + "'!I1", "values": lists},
                  {"range": "'" + CBS_STATS_TAB + "'!L1",
-                  "values": [["Updated " + now.strftime("%d/%m/%Y %H:%M")]]}]}).execute()
+                  "values": [["Updated " + now.strftime("%d/%m/%Y %H:%M")]]}]}).execute(num_retries=4)
     log.info("cb-stats: wrote %d rows to %s" % (len(out) - 1, CBS_STATS_TAB))
     try:
         ensure_cb_dashboard(svc)
@@ -2720,7 +2720,7 @@ def ensure_cb_dashboard(svc):
         # reset the dropdowns every rebuild.
         try:
             meta = svc.spreadsheets().get(spreadsheetId=CBS_APPS2_SHEET_ID,
-                                          fields="sheets(properties(sheetId),charts(chartId))").execute()
+                                          fields="sheets(properties(sheetId),charts(chartId))").execute(num_retries=4)
             for sh in meta.get("sheets", []):
                 if sh["properties"]["sheetId"] == gid and sh.get("charts"):
                     _cbs_state()["dashboard_built"] = True
@@ -2730,7 +2730,7 @@ def ensure_cb_dashboard(svc):
             return
     if gid is None:
         res = svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": [
-            {"addSheet": {"properties": {"title": CBS_DASH_TAB}}}]}).execute()
+            {"addSheet": {"properties": {"title": CBS_DASH_TAB}}}]}).execute(num_retries=4)
         gid = res["replies"][0]["addSheet"]["properties"]["sheetId"]
         log.info("cb-dashboard: created tab %s" % CBS_DASH_TAB)
 
@@ -2780,7 +2780,7 @@ def ensure_cb_dashboard(svc):
         "data": [{"range": D + "!A1", "values": top},
                  {"range": D + "!A14", "values": daily},
                  {"range": D + "!N1", "values": helper},
-                 {"range": D + "!M1", "values": [["start"], ["end"], ["platform"], ["agent"]]}]}).execute()
+                 {"range": D + "!M1", "values": [["start"], ["end"], ["platform"], ["agent"]]}]}).execute(num_retries=4)
 
     def rng(r0, r1, c0, c1):
         return {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1,
@@ -2815,7 +2815,7 @@ def ensure_cb_dashboard(svc):
             "position": {"overlayPosition": {"anchorCell": {"sheetId": gid, "rowIndex": 4, "columnIndex": 6},
                                              "widthPixels": 620, "heightPixels": 320}}}}},
     ]
-    svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": reqs}).execute()
+    svc.spreadsheets().batchUpdate(spreadsheetId=CBS_APPS2_SHEET_ID, body={"requests": reqs}).execute(num_retries=4)
     st = _cbs_state(); st["dashboard_built"] = True; _cbs_save_state(st)
     log.info("cb-dashboard: built %s" % CBS_DASH_TAB)
 
@@ -2831,7 +2831,7 @@ def refresh_tpa_tab(svc):
     _TPA_TAB_AT = time.time()
     try:
         want = int(os.getenv("TPA_CB_SHEET_GID", "0"))
-        meta = svc.spreadsheets().get(spreadsheetId=TPA_CB_SHEET_ID, fields="sheets.properties(sheetId,title)").execute()
+        meta = svc.spreadsheets().get(spreadsheetId=TPA_CB_SHEET_ID, fields="sheets.properties(sheetId,title)").execute(num_retries=4)
         title = next((s["properties"]["title"] for s in meta.get("sheets", []) if s["properties"].get("sheetId") == want), None)
         if not title or title == TPA_CB_TAB:
             return
@@ -2856,7 +2856,7 @@ def tpa_relabel_once(svc):
     def k(v):
         d = "".join(c for c in str(v or "") if c.isdigit())
         return d[-10:] if len(d) >= 10 else ""
-    get = lambda sid, rng: svc.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
+    get = lambda sid, rng: svc.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute(num_retries=4).get("values", [])
     ukdt = {k(r[5]) for r in get(UKDT_SHEET_ID, "'UKDT CT TPA'!A2:F") if len(r) > 5}
     ukdt |= {k(r[5]) for r in get(UKDT_SHEET_ID, "'UKDTCTD1 (Dec)'!A2:F")
              if len(r) > 5 and str(r[1]).strip().lower() == "ukdt ct vid susan dec"}
@@ -2879,7 +2879,7 @@ def tpa_relabel_once(svc):
             data.append({"range": "'%s'!E%d" % (W0_TRACKING_TAB, i), "values": [[camp + " TPA"]]})
     if data:
         svc.spreadsheets().values().batchUpdate(spreadsheetId=W0_TRACKING_SHEET_ID,
-                                                body={"valueInputOption": "RAW", "data": data}).execute()
+                                                body={"valueInputOption": "RAW", "data": data}).execute(num_retries=4)
     open(flag, "w").write(datetime.datetime.now(UK_TZ).isoformat())
     log.info("tpa-relabel: %d of Declan's W0 Tracking rows (last 14 days) marked UKDT TPA / BST TPA (%d UKDT, %d BST numbers on his tabs)"
              % (len(data), len(ukdt), len(bst)))
