@@ -1294,6 +1294,52 @@ def _cbna_has_replied(phone, since_dt):
     return False
 
 
+
+# 23 Nov (Aaron, Bonnie Noble): she messaged "Can I cancel call back pls" before her callback, was rung anyway, marked
+# No answer, and got CBNA1. Before ANY chaser goes, read her WhatsApp from 24h before the appointment: a message asking to
+# cancel, rearrange or move the time, or any message from her after the appointment time, means the team owns the
+# conversation - the chase stops and the reason is written into the Response cell so it never restarts.
+CBNA_CANCEL_RE = re.compile(r"\b(cancel+(ed|ing)?|re-?arrang\w*|re-?schedul\w*|re-?book\w*|(another|different|other|later|new) (time|day|date)|"
+                            r"can'?t (make|do|talk|speak|answer|take)|cannot (make|do|talk|speak|answer|take)|won'?t be (free|available|able)|"
+                            r"not (free|available|able to (talk|speak|answer))|call (me )?(back )?(later|tomorrow|another)|busy|at work|"
+                            r"no longer|don'?t (need|want)|not interested|sorted (it|now)|stop)\b", re.I)
+
+def _appt_dt(date_cell, time_cell):
+    for f in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime((str(date_cell).strip()[:10] + " " + str(time_cell).strip()[:8]).strip(), f).replace(tzinfo=UK_TZ)
+        except Exception:
+            pass
+    return None
+
+def _cbna_client_said(phone, appt):
+    """Why the chase must not go: 'asked to cancel/rearrange: ...' or 'messaged after the callback time', else ''."""
+    if appt is None:
+        return ""
+    try:
+        url = WATI_API_URL + "/api/v1/getMessages/" + format_phone(phone) + "?pageSize=50&pageNumber=1"
+        r = requests.get(url, headers={"Authorization": "Bearer " + WATI_TOKEN, "accept": "application/json"}, timeout=20)
+        items = r.json().get("messages", {}).get("items", [])
+    except Exception as e:
+        log.warning("cbna: cancel-check failed for %s: %s" % (phone, e))
+        return ""
+    since = appt - datetime.timedelta(hours=24)
+    for i in items:
+        if i.get("owner") is not False:
+            continue
+        try:
+            dt = datetime.datetime.strptime((i.get("created") or "")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).astimezone(UK_TZ)
+        except Exception:
+            continue
+        if dt < since:
+            continue
+        txt = str(i.get("text") or i.get("finalText") or "").strip()
+        if CBNA_CANCEL_RE.search(txt):
+            return "client asked to cancel/rearrange (%s): %s" % (dt.strftime("%d/%m %H:%M"), txt[:80])
+        if dt > appt - datetime.timedelta(minutes=5):
+            return "client messaged after the callback time (%s)" % dt.strftime("%d/%m %H:%M")
+    return ""
+
 def _cbna_send(phone, template, param, first_name):
     formatted = format_phone(phone)
     if CBNA_DRY_RUN:
@@ -1440,6 +1486,21 @@ def _cbna_for_sheet(service, cfg) -> int:
                         valueInputOption="RAW",
                         body={"values": [[stamp]]}).execute(num_retries=4)
                     log.info("%s: row %s reply -> Response%s %s" % (tag, i, cur_step, stamp))
+            continue
+
+        said = _cbna_client_said(phone, _appt_dt(g(7), g(8)))
+        if said:
+            resp_col = resp_cols.get(cur_step or 1)
+            stamp = now.strftime(CBNA_STAMP_FMT) + " - chase stopped: " + said
+            if CBNA_DRY_RUN:
+                log.info("%s [DRY RUN] row %s: %s" % (tag, i, stamp))
+            elif resp_col is not None:
+                service.spreadsheets().values().update(
+                    spreadsheetId=cfg["sheet_id"],
+                    range="'" + cfg["tab"] + "'!" + _col_letter(resp_col) + str(i),
+                    valueInputOption="RAW",
+                    body={"values": [[stamp]]}).execute(num_retries=4)
+                log.info("%s: row %s %s" % (tag, i, stamp))
             continue
 
         campaign = g(cfg["campaign_col"]).upper()
